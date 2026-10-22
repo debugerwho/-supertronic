@@ -22,7 +22,7 @@ data class PcmChunkMeta(
  * Off-heap PCM chunk store using 4 MB DirectByteBuffers with LRU eviction and memory bounds.
  */
 class PcmStore(
-    var maxCapacityBytes: Long = DEFAULT_MAX_CAPACITY_BYTES
+    maxCapacityBytes: Long = DEFAULT_MAX_CAPACITY_BYTES
 ) {
     companion object {
         const val BLOCK_SIZE: Int = 4 * 1024 * 1024 // 4 MB per block
@@ -30,6 +30,15 @@ class PcmStore(
         const val MIN_CAPACITY_BYTES: Long = 64L * 1024 * 1024 // 64 MB
         const val MAX_CAPACITY_BYTES_UPPER: Long = 256L * 1024 * 1024 // 256 MB
     }
+
+    /**
+     * Memory budget, always clamped to [MIN_CAPACITY_BYTES]..[MAX_CAPACITY_BYTES_UPPER] so a bad
+     * preference can neither starve the playback buffer nor blow the process heap.
+     */
+    var maxCapacityBytes: Long = maxCapacityBytes.coerceIn(MIN_CAPACITY_BYTES, MAX_CAPACITY_BYTES_UPPER)
+        set(value) {
+            field = value.coerceIn(MIN_CAPACITY_BYTES, MAX_CAPACITY_BYTES_UPPER)
+        }
 
     private class Block(
         val id: Int,
@@ -60,11 +69,32 @@ class PcmStore(
 
     fun has(chunkIndex: Int): Boolean = chunkMap.containsKey(chunkIndex)
 
+    fun sizeOf(chunkIndex: Int): Int? = chunkMap[chunkIndex]?.length
+
     fun get(chunkIndex: Int): ByteArray? {
+        val size = sizeOf(chunkIndex)
+        if (size == null) {
+            _missCount.incrementAndGet()
+            return null
+        }
+        val outBytes = ByteArray(size)
+        val copied = copyInto(chunkIndex, outBytes, 0)
+        return if (copied == size) outBytes else null
+    }
+
+    /**
+     * Copies a stored chunk into [dst] without allocating a new array (hot path of the playback loop).
+     *
+     * @return number of bytes copied, or -1 when the chunk is missing or [dst] is too small.
+     */
+    fun copyInto(chunkIndex: Int, dst: ByteArray, dstOffset: Int = 0): Int {
         val meta = chunkMap[chunkIndex]
         if (meta == null) {
             _missCount.incrementAndGet()
-            return null
+            return -1
+        }
+        if (dstOffset < 0 || dstOffset + meta.length > dst.size) {
+            return -1
         }
 
         synchronized(lock) {
@@ -73,20 +103,25 @@ class PcmStore(
             if (block == null) {
                 chunkMap.remove(chunkIndex)
                 _missCount.incrementAndGet()
-                return null
+                return -1
             }
 
-            val outBytes = ByteArray(meta.length)
             val readBuf = block.buffer.duplicate()
             readBuf.position(meta.offset)
-            readBuf.get(outBytes, 0, meta.length)
+            readBuf.get(dst, dstOffset, meta.length)
             _hitCount.incrementAndGet()
-            return outBytes
+            return meta.length
         }
     }
 
     fun put(chunkIndex: Int, pcm: ByteArray, durationSec: Float, sampleRate: Int = 44100) {
         if (pcm.isEmpty()) return
+        if (pcm.size > BLOCK_SIZE) {
+            // A single chunk is never that long (≈45 s of 44.1 kHz mono PCM); refusing beats a
+            // BufferOverflowException in the middle of a write.
+            android.util.Log.e("PcmStore", "Chunk $chunkIndex is ${pcm.size} bytes, larger than block $BLOCK_SIZE")
+            return
+        }
 
         synchronized(lock) {
             // If already present, remove old reference

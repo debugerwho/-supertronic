@@ -317,17 +317,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (currentStatus == PlaybackStatus.IDLE || currentStatus == PlaybackStatus.COMPLETED || currentStatus == PlaybackStatus.ERROR) {
             val langToUse = if (selectedLang.value == "auto") detectedLang.value else selectedLang.value
             val showOverlay = overlayEnabled.value && Settings.canDrawOverlays(getApplication())
+            // The paragraph is resolved to a chunk inside playText(), after segmentation built a fresh
+            // index. Seeking right after playText() used the previous (or empty) index and therefore
+            // always restarted reading from the beginning of the chapter.
             service.playText(
                 text = currentChapterText.value,
                 lang = langToUse,
                 voiceId = selectedVoice.value,
                 steps = synthesisSteps.value,
                 speed = speechSpeed.value,
-                startIndex = 0,
+                startParagraphIndex = paragraphIndex,
                 showOverlay = showOverlay,
                 paragraphs = currentParagraphs.value
             )
-            service.seekToParagraph(paragraphIndex)
         } else {
             service.seekToParagraph(paragraphIndex)
         }
@@ -355,6 +357,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun jumpSeconds(deltaSec: Int) {
         playbackService?.jumpSeconds(deltaSec)
+    }
+
+    /** Absolute seek used by the timeline slider and MediaSession scrubbing. */
+    fun seekToSeconds(seconds: Float) {
+        playbackService?.seekToSeconds(seconds)
     }
 
     fun onSpeedChanged(newSpeed: Float) {

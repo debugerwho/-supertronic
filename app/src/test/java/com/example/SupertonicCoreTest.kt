@@ -281,4 +281,80 @@ class SupertonicCoreTest {
         val chunkForPara = sourceIndex.findChunkIndexByParagraph(0)
         assertEquals(0, chunkForPara)
     }
+    @Test
+    fun testSourceIndex_offsetsShiftWhenEarlierChunkGetsExactDuration() {
+        val chunks = listOf(
+            com.example.supertonic.language.TextChunk(0, "Первая.", 0, 7, "ru"),
+            com.example.supertonic.language.TextChunk(1, "Вторая.", 8, 15, "ru"),
+            com.example.supertonic.language.TextChunk(2, "Третья.", 16, 23, "ru")
+        )
+        val sourceIndex = com.example.supertonic.core.SourceIndex(chunks, emptyList(), sampleRate = 1000)
+
+        val secondBefore = sourceIndex.sampleStartOf(1)
+        val thirdBefore = sourceIndex.sampleStartOf(2)
+
+        // Exact duration shorter than the estimate must pull every later chunk back.
+        sourceIndex.updateSynthesizedChunk(0, 0.5f)
+
+        assertEquals(500L, sourceIndex.sampleStartOf(1))
+        assertEquals(500L - secondBefore + thirdBefore, sourceIndex.sampleStartOf(2))
+        assertTrue(sourceIndex.sampleStartOf(1) < secondBefore)
+        assertEquals(0.5f, sourceIndex.durationSecondsOf(0), 0.0001f)
+    }
+
+    @Test
+    fun testSourceIndex_sampleLookupIsMonotonic() {
+        val chunks = (0 until 4).map { idx ->
+            com.example.supertonic.language.TextChunk(idx, "Фраза номер $idx.", idx * 20, (idx + 1) * 20, "ru")
+        }
+        val sourceIndex = com.example.supertonic.core.SourceIndex(chunks, emptyList(), sampleRate = 1000)
+        for (idx in 0 until 4) {
+            sourceIndex.updateSynthesizedChunk(idx, 1.0f)
+        }
+
+        assertEquals(0, sourceIndex.findChunkIndexBySample(0L))
+        assertEquals(0, sourceIndex.findChunkIndexBySample(999L))
+        assertEquals(1, sourceIndex.findChunkIndexBySample(1000L))
+        assertEquals(2, sourceIndex.findChunkIndexBySample(2500L))
+        assertEquals(3, sourceIndex.findChunkIndexBySample(10_000L))
+    }
+
+    @Test
+    fun testSourceIndex_paragraphLookupAcrossMultipleParagraphs() {
+        val chunks = (0 until 4).map { idx ->
+            com.example.supertonic.language.TextChunk(idx, "Фраза $idx.", idx * 10, (idx + 1) * 10, "ru")
+        }
+        val paragraphs = listOf(
+            com.example.supertonic.data.ParagraphItem(0, "Фраза 0. Фраза 1.", 0, 19),
+            com.example.supertonic.data.ParagraphItem(1, "Фраза 2. Фраза 3.", 20, 39)
+        )
+        val sourceIndex = com.example.supertonic.core.SourceIndex(chunks, paragraphs, sampleRate = 1000)
+
+        assertEquals(0, sourceIndex.findChunkIndexByParagraph(0))
+        assertEquals(2, sourceIndex.findChunkIndexByParagraph(1))
+    }
+
+    @Test
+    fun testPcmStore_copyIntoReusesBufferAndCapacityIsClamped() {
+        val store = com.example.supertonic.audio.PcmStore(maxCapacityBytes = 1)
+        try {
+            // Capacity below the supported minimum must be clamped, not honoured.
+            assertEquals(com.example.supertonic.audio.PcmStore.MIN_CAPACITY_BYTES, store.maxCapacityBytes)
+
+            val pcm = ByteArray(4096) { (it % 64).toByte() }
+            store.put(7, pcm, durationSec = 0.1f)
+            assertEquals(4096, store.sizeOf(7))
+
+            val dst = ByteArray(4096)
+            assertEquals(4096, store.copyInto(7, dst))
+            assertArrayEquals(pcm, dst)
+
+            // Too small / missing chunk must not throw.
+            assertEquals(-1, store.copyInto(7, ByteArray(16)))
+            assertEquals(-1, store.copyInto(8, dst))
+        } finally {
+            store.clear()
+        }
+    }
+
 }

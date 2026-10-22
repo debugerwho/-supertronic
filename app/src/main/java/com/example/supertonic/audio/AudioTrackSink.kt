@@ -119,32 +119,47 @@ class AudioTrackSink(
         }
     }
 
+    /**
+     * Drops all buffered audio and resets frame counters to zero.
+     *
+     * Frame counters must start from zero after a flush: absolute timeline position is owned by
+     * [PlaybackClock] (baseSampleOffset), and the sink only reports frames played *since* the flush.
+     * Keeping the old counters here made every seek jump the clock forward by the whole amount of
+     * audio written earlier in the session.
+     */
     @Synchronized
     fun flush() {
-        val track = audioTrack ?: return
+        val track = audioTrack
         try {
-            track.pause()
-            track.flush()
-            val currentHead = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
-            headOffsetFrames = _totalWrittenFrames.get() - currentHead
-            lastObservedHead = currentHead
+            if (track != null) {
+                track.pause()
+                track.flush()
+            }
         } catch (e: Exception) {
             Log.e(tag, "Error flushing AudioTrack", e)
+        } finally {
+            _totalWrittenFrames.set(0)
+            headOffsetFrames = 0L
+            lastObservedHead = 0L
+            isPlaying = false
         }
     }
 
     @Synchronized
     fun stop() {
-        val track = audioTrack ?: return
+        val track = audioTrack
         try {
-            track.stop()
-            track.flush()
+            if (track != null) {
+                track.stop()
+                track.flush()
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Error stopping AudioTrack", e)
+        } finally {
             isPlaying = false
             _totalWrittenFrames.set(0)
             headOffsetFrames = 0L
             lastObservedHead = 0L
-        } catch (e: Exception) {
-            Log.e(tag, "Error stopping AudioTrack", e)
         }
     }
 

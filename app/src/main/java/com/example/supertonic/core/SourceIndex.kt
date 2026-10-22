@@ -21,6 +21,9 @@ data class IndexedChunkSpan(
 
 /**
  * Sample-accurate index connecting document paragraphs, text chunks, and audio timeline.
+ *
+ * Lookups are O(log n) and both index construction and duration updates are linear in the number
+ * of chunks (no per-chunk paragraph scans, no full re-layout for every synthesized chunk).
  */
 class SourceIndex(
     val chunks: List<TextChunk>,
@@ -34,14 +37,34 @@ class SourceIndex(
     private val spans: List<IndexedChunkSpan>
 
     init {
-        val spanList = mutableListOf<IndexedChunkSpan>()
-        for (chunk in chunks) {
-            // Find paragraph containing chunk start offset
-            val pIdx = paragraphs.indexOfFirst { p ->
-                chunk.startOffset >= p.charStart && chunk.startOffset <= p.charEnd
-            }.coerceAtLeast(0)
+        val spanList = ArrayList<IndexedChunkSpan>(chunks.size)
 
-            // Initial estimate for sample length based on character length
+        // Paragraphs and chunks are both ordered by character offset, so a single moving cursor is
+        // enough: the previous implementation scanned every paragraph for every chunk (O(n·m)).
+        var paragraphCursor = 0
+
+        for (chunk in chunks) {
+            if (paragraphs.isNotEmpty()) {
+                while (paragraphCursor + 1 < paragraphs.size &&
+                    chunk.startOffset > paragraphs[paragraphCursor].charEnd
+                ) {
+                    paragraphCursor++
+                }
+            }
+
+            val pIdx = if (paragraphs.isEmpty()) {
+                0
+            } else {
+                val candidate = paragraphs[paragraphCursor]
+                if (chunk.startOffset in candidate.charStart..candidate.charEnd) {
+                    paragraphCursor
+                } else {
+                    // Offset falls into a gap between paragraphs: keep the one that starts after it,
+                    // as long as it is not the last one; otherwise stay on the current paragraph.
+                    max(0, paragraphCursor)
+                }
+            }
+
             val estDurationSec = max(0.4f, chunk.text.length / ESTIMATED_CHARS_PER_SEC)
             val estSamples = (estDurationSec * sampleRate).toLong()
 
@@ -57,15 +80,26 @@ class SourceIndex(
                 )
             )
         }
-        recalculateSampleOffsets(spanList)
+
+        recalculateOffsets(spanList, 0)
         spans = spanList
     }
 
-    private fun recalculateSampleOffsets(list: List<IndexedChunkSpan>) {
-        var currentSample = 0L
-        for (span in list) {
-            span.sampleStart = currentSample
-            currentSample += span.sampleLength
+    /**
+     * Recomputes sample starts from [fromIndex] to the end. Only spans at or after the changed chunk
+     * can move, so a duration update costs O(remaining chunks) instead of a full re-layout.
+     */
+    private fun recalculateOffsets(list: List<IndexedChunkSpan>, fromIndex: Int) {
+        if (list.isEmpty()) return
+        val start = fromIndex.coerceIn(0, list.size - 1)
+        var currentSample = if (start == 0) {
+            0L
+        } else {
+            list[start - 1].sampleStart + list[start - 1].sampleLength
+        }
+        for (i in start until list.size) {
+            list[i].sampleStart = currentSample
+            currentSample += list[i].sampleLength
         }
     }
 
@@ -76,29 +110,62 @@ class SourceIndex(
         val span = spans.getOrNull(chunkIndex) ?: return
         span.sampleLength = (durationSec * sampleRate).toLong()
         span.isSynthesized = true
-        recalculateSampleOffsets(spans)
+        recalculateOffsets(spans, chunkIndex)
     }
 
     fun getSpan(chunkIndex: Int): IndexedChunkSpan? = spans.getOrNull(chunkIndex)
 
+    fun sampleStartOf(chunkIndex: Int): Long = spans.getOrNull(chunkIndex)?.sampleStart ?: 0L
+
+    /** Duration of the chunk in seconds (exact after synthesis, estimate before). */
+    fun durationSecondsOf(chunkIndex: Int): Float {
+        val span = spans.getOrNull(chunkIndex) ?: return 0f
+        return span.sampleLength.toFloat() / sampleRate.toFloat()
+    }
+
     fun findChunkIndexByParagraph(paragraphIndex: Int): Int {
-        val span = spans.find { it.paragraphIndex == paragraphIndex }
-        return span?.chunkIndex ?: 0
+        // Paragraphs are ordered: binary search on the first span of the paragraph.
+        var low = 0
+        var high = spans.size - 1
+        var result = 0
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            val p = spans[mid].paragraphIndex
+            when {
+                p < paragraphIndex -> low = mid + 1
+                p > paragraphIndex -> high = mid - 1
+                else -> {
+                    result = mid
+                    high = mid - 1
+                }
+            }
+        }
+        return if (result in spans.indices) spans[result].chunkIndex else 0
     }
 
     fun findChunkIndexBySample(sampleOffset: Long): Int {
         if (spans.isEmpty()) return 0
         if (sampleOffset <= 0) return 0
-        for (span in spans) {
-            if (sampleOffset >= span.sampleStart && sampleOffset < span.sampleStart + span.sampleLength) {
-                return span.chunkIndex
+
+        var low = 0
+        var high = spans.size - 1
+        var candidate = 0
+        while (low <= high) {
+            val mid = (low + high) ushr 1
+            if (spans[mid].sampleStart <= sampleOffset) {
+                candidate = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
             }
         }
-        return spans.last().chunkIndex
+        return spans[candidate].chunkIndex
     }
 
     fun getTotalEstimatedDurationSeconds(): Float {
-        val totalSamples = spans.sumOf { it.sampleLength }
+        if (spans.isEmpty()) return 0f
+        val last = spans.last()
+        val totalSamples = last.sampleStart + last.sampleLength
         return totalSamples.toFloat() / sampleRate.toFloat()
     }
 

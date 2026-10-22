@@ -11,7 +11,7 @@
   - Удален класс `PcmDiskCache.kt` и все вызовы.
   - Удалена запись `session_spool_*.pcm` и временных `batch_export_*.pcm`.
   - При старте `SupertonicPlaybackService` выполняет одноразовую очистку устаревших `.pcm` файлов в `cacheDir`.
-  - Промежуточный синтез и пакетный экспорт работают исключительно в RAM (`List<ByteArray>`), запись ведется только в конечный целевой файл (.m4a / .wav).
+  - Промежуточный синтез и пакетный экспорт работают исключительно в RAM, запись ведется только в конечный целевой файл (.m4a / .wav). _(Сессия 2.1: экспорт больше не копит `List<ByteArray>` — PCM сразу уходит в потоковый кодировщик.)_
 - **Ошибка синтеза не маскируется (Задача 3):**
   - Удалена подстановка тишины (`250ms silence`).
   - При ошибке `synthesizeChunk`: статус переходит в `PlaybackStatus.ERROR`, выводится сообщение с номером фразы (напр., «Ошибка синтеза фразы №3»), чанк не считается готовым, синтез останавливается.
@@ -76,3 +76,60 @@
 
 ### 5. Следующий шаг (Сессия 2)
 - Оптимизация инференса ONNX Runtime, многопоточность синтеза, калибровка производительности под процессор и буферизация аудиопотока.
+
+---
+
+## Сессия 2: ядро движка и RAM-аудио (коммит `cdbb498`)
+
+### 1. Сделано
+- **Слой `audio/` вместо `AudioTrackPlayer`:** `AudioTrackSink` (один `AudioTrack`, запись слайсами ≤100 мс, `PlaybackParams` без изменения питча), `PcmRing` (окно 45 с назад / 10 мин вперёд), `PlaybackClock` (позиция в сэмплах), `SynthesisScheduler` (P0 текущий → P1 +3 → P2 окно → P3 seek → P4 остаток, счётчик поколений).
+- **`PcmStore`:** off-heap `ByteBuffer.allocateDirect` блоками 4 МБ, LRU-вытеснение блоков, счётчики hit/miss, бюджет по умолчанию 128 МБ.
+- **`EngineHost`:** единственный экземпляр `OnnxSpeechEngine` на процесс, `Mutex` вокруг `load`/`withEngine` (инференс сериализован), `StateFlow` для `isLoaded/currentThreads/voiceStyles`.
+- **`core/SourceIndex`:** связка «абзац ↔ чанк ↔ сэмпл», таймлайн `MM:SS / ≈MM:SS`.
+- **Точные длительности:** `duration = rawDuration / speed` (эвристики 1.05/0.18 удалены), шум через `ThreadLocalRandom`.
+- **Модель:** кэш размеров в `SharedPreferences` с TTL 7 дней, HEAD не чаще одного раза на процесс.
+- **Экспорт:** предупреждение при нехватке RAM, экспорт не блокирует воспроизведение.
+- **Тесты:** +93 строки (`PcmStore`, `PcmRing`, `SourceIndex`, WAV-заголовок).
+
+### 2. Не проверено в реальном окружении
+- Фактическая задержка старта воспроизведения и отсутствие разрывов на реальном устройстве.
+- Реальный прирост от `totalSteps = 2` на слабых SoC.
+
+### 3. Технические долги на момент коммита
+- `domain/ReadSession.kt` — мёртвый дубль состояния (удалён в 2.1).
+- Экспорт копил весь PCM в `List<ByteArray>` (исправлено в 2.1).
+
+---
+
+## Сессия 2.1: исправление дефектов код-ревью (ветка `arena/c3e0cbd7-supertronic`)
+
+Источник задач: `docs/REVIEW_SESSION1_2026-10-22.md` (C1, M2–M4) и `docs/REVIEW_SESSION2_2026-10-22.md` (C1, C2, M1–M7).
+
+### 1. Исправлено
+
+| Дефект | Что изменено | Файлы |
+|---|---|---|
+| **C1 (сессия 2)** — после любого seek позиция уезжала вперёд на всё записанное аудио | `AudioTrackSink.flush()` теперь полностью сбрасывает счётчики кадров, а не пересчитывает `headOffsetFrames`; абсолютная позиция живёт только в `PlaybackClock` | `audio/AudioTrackSink.kt`, `audio/PlaybackClock.kt` |
+| Двойной `flush()` при seek, `retrySynthesis()` без восстановления базы | В `seekToChunk()` ровно один флаш (внутри `clock.resetToSample`); `retrySynthesis()` переустанавливает базу по текущему чанку | `SupertonicPlaybackService.kt` |
+| **C2 (сессия 2)** — тап по абзацу из IDLE всегда начинал с начала | `playText(..., startParagraphIndex)`: чанк абзаца резолвится внутри `prepJob` после сегментации; UI больше не зовёт `seekToParagraph` сразу после старта | `SupertonicPlaybackService.kt`, `ui/MainViewModel.kt` |
+| **M1** — пауза/резюм повторяли фразу | Пауза не сбрасывает буфер и запоминает точный байтовый offset; резюм продолжает запись с него (учтён «лишний» слайс, успевший уйти после отмены) | `SupertonicPlaybackService.kt` |
+| Гонка «пауза во время блокирующей записи» | `pause()`/`stop()` увеличивают `generationId` — только это останавливает цикл записи, отмена корутины его не прерывает | `SupertonicPlaybackService.kt` |
+| **M2 (сессии 1 и 2)** — экспорт держал всю книгу в `List<ByteArray>` | Новые потоковые писатели `openM4aWriter`/`openWavWriter`: чанк сразу кодируется и пишется в файл. Отказ «>400 МБ RAM» больше не нужен и убран. Пиковый расход — один чанк + буферы кодека | `playback/MediaCodecExporter.kt`, `SupertonicPlaybackService.kt` |
+| **M3** — 263 строки мёртвого `ReadSession` | Файл удалён; удалён и неиспользуемый `playback/PcmChunk.kt` | `domain/`, `playback/` |
+| **M4** — позиция обновлялась только на границах чанков, у MediaSession не было seek | Тикер позиции каждые 250 мс (`UI_TICK_MS`) во время записи; `ACTION_SEEK_TO/FAST_FORWARD/REWIND`, `onSeekTo`, реальные позиция и скорость в `PlaybackStateCompat`; `seekToSeconds()` в сервисе и VM | `SupertonicPlaybackService.kt`, `ui/MainViewModel.kt` |
+| **M5** — границы памяти `PcmStore` не применялись | `maxCapacityBytes` жёстко клампится в 64–256 МБ; `put()` отказывается от чанка больше блока вместо `BufferOverflowException` | `audio/PcmStore.kt` |
+| Аллокация `ByteArray` на каждый чанк в цикле записи | `copyInto()`/`copyChunkInto()` + переиспользуемый буфер в сервисе | `audio/PcmStore.kt`, `audio/PcmRing.kt`, `SupertonicPlaybackService.kt` |
+| **M6** — точное сравнение с кэшированным HEAD-размером | ±2 % от ожидаемого размера; при расхождении с кэшем, но совпадении с манифестом — запись кэша инвалидируется (без вечного «файл повреждён») | `engine/ModelManager.kt` |
+| **M7** — `indexOfFirst` по всем абзацам на каждый чанк | Один курсор при построении индекса; бинарный поиск для `findChunkIndexBySample`/`findChunkIndexByParagraph`; обновление длительности пересчитывает только хвост | `core/SourceIndex.kt` |
+| Дрейф таймлайна при уточнении длительностей | `PlaybackClock.shiftBaseBy()` — база сдвигается на дельту `sampleStart` активного чанка | `audio/PlaybackClock.kt`, `SupertonicPlaybackService.kt` |
+| Обход `Mutex` через `EngineHost.rawEngine` | Доступ стал `internal`, из сервиса убран публичный `engine`; `EngineHost.load()` идемпотентен (не перезагружает ~400 МБ модель на каждый вход в чтение) | `engine/EngineHost.kt`, `SupertonicPlaybackService.kt` |
+
+### 2. Тесты
+Добавлены: сдвиг смещений при уточнении длительности, монотонность `findChunkIndexBySample`, поиск по нескольким абзацам, `PcmStore.copyInto` + кламп бюджета.
+Запуск: `./gradlew :app:testDebugUnitTest` (в песочнице Android SDK нет — тесты не запускались).
+
+### 3. Что осталось на Сессию 3 (P3)
+- Три фазы экспорта с Media3 `Mp4Muxer` и выбор кодека/битрейта (сейчас — потоковый `MediaCodec`/`MediaMuxer`, файл в RAM не держится).
+- 31 язык + `na`: сквозная проверка `LanguageDetector` и сегментера.
+- Пользовательский выбор ядер: реальная привязка потоков (вне AI Studio) + `/proc`-наблюдение.
+- Обновление `docs/REVIEW_SESSION*.md` после прогона на устройстве.

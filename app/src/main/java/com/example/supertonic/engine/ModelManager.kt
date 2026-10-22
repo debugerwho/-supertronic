@@ -187,13 +187,29 @@ class ModelManager(private val context: Context) {
             val actualLength = file.length()
             val cachedExpected = headContentLengths[desc.relativePath] ?: cachedContentLengths[desc.relativePath]
 
-            val isValid = if (cachedExpected != null && cachedExpected > 0) {
-                actualLength == cachedExpected
-            } else {
-                // If exact HEAD size is not yet cached, tolerate minor manifest deviations <= 2%
-                val diff = Math.abs(actualLength - desc.expectedSizeBytes)
-                val tolerance = (desc.expectedSizeBytes * 0.02).toLong()
-                diff <= tolerance
+            // Neither a HEAD size nor the manifest length is byte-exact in practice: CDN re-packs and
+            // LFS rewrites shift the size a little. Anything within 2% is accepted; beyond that the
+            // file is considered broken. A stale cached HEAD size must never make a valid model
+            // permanently "corrupted" (and must never force a re-download or break offline mode).
+            val expected = cachedExpected ?: desc.expectedSizeBytes
+            val tolerance = (expected * 0.02).toLong()
+            val diff = Math.abs(actualLength - expected)
+
+            val manifestTolerance = (desc.expectedSizeBytes * 0.02).toLong()
+            val matchesManifest = Math.abs(actualLength - desc.expectedSizeBytes) <= manifestTolerance
+
+            val isValid = when {
+                diff <= tolerance -> true
+                // Cached HEAD size disagrees, but the file still matches the manifest: forget the
+                // cached value so the next HEAD fetch (or the next launch) can correct it.
+                cachedExpected != null && matchesManifest -> {
+                    headContentLengths.remove(desc.relativePath)
+                    cachedContentLengths.remove(desc.relativePath)
+                    prefs.edit().remove("size_rev1:${desc.relativePath}").apply()
+                    Log.w(tag, "Cached size for ${desc.relativePath} looks stale, falling back to manifest")
+                    true
+                }
+                else -> false
             }
 
             // Obvious corruption: <90% or >110% of manifest

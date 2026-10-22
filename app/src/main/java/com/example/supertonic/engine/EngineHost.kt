@@ -24,15 +24,35 @@ object EngineHost {
     private val _voiceStyles = MutableStateFlow<List<VoiceStyle>>(emptyList())
     val voiceStyles: StateFlow<List<VoiceStyle>> = _voiceStyles.asStateFlow()
 
-    val rawEngine: SpeechEngine get() = onnxEngine
+    private var loadedDirPath: String? = null
+    private var loadedThreads: Int = -1
+
+    /** Direct engine access for legacy read-only callers. Inference must go through [withEngine]. */
+    internal val rawEngine: SpeechEngine get() = onnxEngine
 
     fun getDiagnostics(): List<ChunkSynthesisDiagnostic> = onnxEngine.getDiagnostics()
 
     suspend fun load(modelDir: File, numThreads: Int = 2): Boolean = mutex.withLock {
+        // Idempotent: re-entering reading must not reload the ~400 MB model with the same settings.
+        if (onnxEngine.isLoaded &&
+            loadedDirPath == modelDir.absolutePath &&
+            loadedThreads == numThreads
+        ) {
+            _isLoaded.value = true
+            return@withLock true
+        }
+
         val result = onnxEngine.load(modelDir, numThreads)
         _isLoaded.value = onnxEngine.isLoaded
         _currentThreads.value = onnxEngine.currentThreads
         _voiceStyles.value = onnxEngine.getVoiceStyles()
+        if (result) {
+            loadedDirPath = modelDir.absolutePath
+            loadedThreads = numThreads
+        } else {
+            loadedDirPath = null
+            loadedThreads = -1
+        }
         result
     }
 
@@ -46,6 +66,8 @@ object EngineHost {
 
     suspend fun close() = mutex.withLock {
         onnxEngine.close()
+        loadedDirPath = null
+        loadedThreads = -1
         _isLoaded.value = false
         _voiceStyles.value = emptyList()
     }

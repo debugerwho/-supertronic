@@ -1,8 +1,6 @@
 package com.example.supertonic.audio
 
 import com.example.supertonic.language.TextChunk
-import java.util.Collections
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Sliding window manager for playback audio:
@@ -17,15 +15,21 @@ class PcmRing(
         const val ESTIMATED_CHARS_PER_SEC = 13.0f
     }
 
-    private val readyIndices = Collections.newSetFromMap(ConcurrentHashMap<Int, Boolean>())
-
     fun isReady(chunkIndex: Int): Boolean = pcmStore.has(chunkIndex)
 
     fun getChunk(chunkIndex: Int): ByteArray? = pcmStore.get(chunkIndex)
 
+    fun sizeOf(chunkIndex: Int): Int? = pcmStore.sizeOf(chunkIndex)
+
+    /**
+     * Copies the chunk into a caller-owned buffer, avoiding a fresh allocation per chunk.
+     * @return bytes copied, or -1 when the chunk is absent or [dst] is too small.
+     */
+    fun copyChunkInto(chunkIndex: Int, dst: ByteArray, dstOffset: Int = 0): Int =
+        pcmStore.copyInto(chunkIndex, dst, dstOffset)
+
     fun putChunk(chunkIndex: Int, pcm: ByteArray, durationSec: Float, sampleRate: Int = 44100) {
         pcmStore.put(chunkIndex, pcm, durationSec, sampleRate)
-        readyIndices.add(chunkIndex)
     }
 
     /**
@@ -66,12 +70,10 @@ class PcmRing(
      */
     fun advance(currentIndex: Int, chunks: List<TextChunk>) {
         val window = calculateWindowIndices(currentIndex, chunks)
-        readyIndices.retainAll(window)
         pcmStore.evictExcept(window)
     }
 
     fun clear() {
-        readyIndices.clear()
         pcmStore.clear()
     }
 }

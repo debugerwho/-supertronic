@@ -1,3 +1,5 @@
+> **Статус:** C1, M2, M3, M4 исправлены в ветке `arena/c3e0cbd7-supertronic` — см. `docs/FIXES_2026-10-22.md`. Файл остаётся как история проверки.
+
 # Ревью сессии 1 — проверка по коду (22.10.2026)
 
 Код сессии 1 найден в `origin/main` (коммит `743a720` «refactor: remove unused dependencies and
