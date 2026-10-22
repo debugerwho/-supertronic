@@ -1,0 +1,8 @@
+{
+  "name": "Supertonic Reader",
+  "description": "Автономный синтез речи Supertonic 3: фоновое чтение, плавающая панель, автоопределение языка с приоритетом русского и экспорт в AAC/WAV.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
