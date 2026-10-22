@@ -64,7 +64,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val downloadState: StateFlow<ModelDownloadState> = modelManager.downloadState
     val currentEngineThreads: Int
-        get() = playbackService?.engine?.currentThreads ?: cpuAffinity.getActiveThreadCount()
+        get() = com.example.supertonic.engine.EngineHost.currentThreads.value
 
     // Document and Paragraphs on-disk management
     val currentDocMetadata = MutableStateFlow<DocumentMetadata?>(null)
@@ -305,8 +305,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 voiceId = selectedVoice.value,
                 steps = synthesisSteps.value,
                 speed = speechSpeed.value,
-                showOverlay = showOverlay
+                showOverlay = showOverlay,
+                paragraphs = currentParagraphs.value
             )
+        }
+    }
+
+    fun readFromParagraph(paragraphIndex: Int) {
+        val service = playbackService ?: return
+        val currentStatus = servicePlaybackState.value.status
+        if (currentStatus == PlaybackStatus.IDLE || currentStatus == PlaybackStatus.COMPLETED || currentStatus == PlaybackStatus.ERROR) {
+            val langToUse = if (selectedLang.value == "auto") detectedLang.value else selectedLang.value
+            val showOverlay = overlayEnabled.value && Settings.canDrawOverlays(getApplication())
+            service.playText(
+                text = currentChapterText.value,
+                lang = langToUse,
+                voiceId = selectedVoice.value,
+                steps = synthesisSteps.value,
+                speed = speechSpeed.value,
+                startIndex = 0,
+                showOverlay = showOverlay,
+                paragraphs = currentParagraphs.value
+            )
+            service.seekToParagraph(paragraphIndex)
+        } else {
+            service.seekToParagraph(paragraphIndex)
         }
     }
 

@@ -341,7 +341,10 @@ fun ReaderScreen(viewModel: MainViewModel) {
                                     Surface(
                                         shape = RoundedCornerShape(8.dp),
                                         color = CoralPrimary.copy(alpha = 0.08f),
-                                        modifier = Modifier.fillMaxWidth()
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .clickable { viewModel.readFromParagraph(pIdx) }
                                     ) {
                                         Text(
                                             text = annotated,
@@ -352,13 +355,22 @@ fun ReaderScreen(viewModel: MainViewModel) {
                                         )
                                     }
                                 } else {
-                                    Text(
-                                        text = paragraph.text,
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        color = if (isCurrentParagraph) TextPrimary else TextSecondary,
-                                        lineHeight = 24.sp,
-                                        modifier = Modifier.padding(4.dp)
-                                    )
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = Color.Transparent,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .clickable { viewModel.readFromParagraph(pIdx) }
+                                    ) {
+                                        Text(
+                                            text = paragraph.text,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            color = if (isCurrentParagraph) TextPrimary else TextSecondary,
+                                            lineHeight = 24.sp,
+                                            modifier = Modifier.padding(8.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -503,12 +515,20 @@ fun ReaderScreen(viewModel: MainViewModel) {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "Фраза ${playbackState.currentChunkIndex + 1} из ${maxOf(1, playbackState.totalChunks)}",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = CoralPrimary
-                        )
+                        Column {
+                            Text(
+                                text = "Фраза ${playbackState.currentChunkIndex + 1} из ${maxOf(1, playbackState.totalChunks)}",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = CoralPrimary
+                            )
+                            Text(
+                                text = playbackState.timelineDisplay,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MintVoice
+                            )
+                        }
                         Text(
                             text = "Буфер: ${String.format("%.1f", playbackState.bufferedSeconds)}с | RTF: ${String.format("%.2f", playbackState.rtf)}",
                             fontSize = 11.sp,

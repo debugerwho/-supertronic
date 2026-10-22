@@ -75,39 +75,38 @@ class PerformanceCalibrator(private val context: Context) {
         onProgress: (currentThreads: Int, totalCandidates: Int) -> Unit
     ): CalibrationReport = withContext(Dispatchers.Default) {
         val candidates = getCandidateThreadCounts()
+        val cores = Runtime.getRuntime().availableProcessors()
         val testPhrase = "Тестовая калибровка скорости синтеза речи."
         val results = mutableListOf<CalibrationStepResult>()
 
-        val engine = SupertonicEngine()
-        val cores = Runtime.getRuntime().availableProcessors()
-
         for ((index, threads) in candidates.withIndex()) {
             onProgress(threads, candidates.size)
-            val success = engine.load(modelDir, numThreads = threads)
+            val success = EngineHost.load(modelDir, numThreads = threads)
             if (!success) {
                 Log.w(tag, "Engine failed to load with $threads threads")
                 continue
             }
 
-            val voiceStyle = engine.getVoiceStyles().firstOrNull()
+            val voiceStyle = EngineHost.getVoiceStyles().firstOrNull()
             if (voiceStyle != null) {
-                // Warmup run
-                engine.synthesizeChunk(testPhrase, "ru", voiceStyle, totalSteps = 2, speed = 1.0f)
+                EngineHost.withEngine { engine ->
+                    // Warmup run
+                    engine.synthesizeChunk(testPhrase, "ru", voiceStyle, totalSteps = 2, speed = 1.0f)
 
-                // Measured run with 3 steps
-                val measured = engine.synthesizeChunk(testPhrase, "ru", voiceStyle, totalSteps = 3, speed = 1.0f)
-                if (measured != null) {
-                    results.add(
-                        CalibrationStepResult(
-                            threadCount = threads,
-                            durationSec = measured.durationSeconds,
-                            synthesisTimeMs = measured.synthesisTimeMs,
-                            rtf = measured.rtf
+                    // Measured run with 3 steps
+                    val measured = engine.synthesizeChunk(testPhrase, "ru", voiceStyle, totalSteps = 3, speed = 1.0f)
+                    if (measured != null) {
+                        results.add(
+                            CalibrationStepResult(
+                                threadCount = threads,
+                                durationSec = measured.durationSeconds,
+                                synthesisTimeMs = measured.synthesisTimeMs,
+                                rtf = measured.rtf
+                            )
                         )
-                    )
+                    }
                 }
             }
-            engine.close()
         }
 
         // Pick optimal thread count: lowest RTF with slight bias against exhausting all cores

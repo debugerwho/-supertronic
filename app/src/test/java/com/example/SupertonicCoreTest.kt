@@ -188,4 +188,97 @@ class SupertonicCoreTest {
             wavFile.delete()
         }
     }
+
+    @Test
+    fun testPcmStore_offHeapAllocationAndRetrieval() {
+        val store = com.example.supertonic.audio.PcmStore(maxCapacityBytes = 8 * 1024 * 1024)
+        try {
+            val pcm1 = ByteArray(1024) { (it % 128).toByte() }
+            val pcm2 = ByteArray(2048) { (it % 127).toByte() }
+
+            store.put(0, pcm1, durationSec = 1.0f)
+            store.put(1, pcm2, durationSec = 2.0f)
+
+            assertTrue("Store should have chunk 0", store.has(0))
+            assertTrue("Store should have chunk 1", store.has(1))
+            assertFalse("Store should not have chunk 2", store.has(2))
+
+            val retrieved0 = store.get(0)
+            assertNotNull(retrieved0)
+            assertArrayEquals(pcm1, retrieved0)
+
+            val retrieved1 = store.get(1)
+            assertNotNull(retrieved1)
+            assertArrayEquals(pcm2, retrieved1)
+
+            assertEquals(2L, store.hitCount)
+            store.get(99)
+            assertEquals(1L, store.missCount)
+            assertTrue("Allocated bytes should be at least 4MB", store.allocatedBytes >= 4 * 1024 * 1024)
+        } finally {
+            store.clear()
+        }
+    }
+
+    @Test
+    fun testPcmRing_windowRetentionAndEviction() {
+        val ring = com.example.supertonic.audio.PcmRing(com.example.supertonic.audio.PcmStore(16 * 1024 * 1024))
+        try {
+            val dummyChunks = (0 until 30).map { idx ->
+                com.example.supertonic.language.TextChunk(
+                    index = idx,
+                    text = "Тестовая фраза номер $idx для проверки окна воспроизведения.",
+                    startOffset = idx * 60,
+                    endOffset = (idx + 1) * 60,
+                    resolvedLang = "ru"
+                )
+            }
+
+            for (i in 0 until 10) {
+                ring.putChunk(i, ByteArray(512), 1.0f)
+            }
+
+            // Window around chunk 5
+            val window = ring.calculateWindowIndices(currentIndex = 5, chunks = dummyChunks)
+            assertTrue("Window must contain current index 5", window.contains(5))
+            assertTrue("Window must contain backward index 4", window.contains(4))
+            assertTrue("Window must contain forward index 6", window.contains(6))
+
+            // Advance to chunk 8 and evict except window
+            ring.advance(currentIndex = 8, chunks = dummyChunks)
+            assertTrue("Chunk 8 should remain ready", ring.isReady(8))
+        } finally {
+            ring.clear()
+        }
+    }
+
+    @Test
+    fun testSourceIndex_sampleMappingAndFormatting() {
+        val chunks = listOf(
+            com.example.supertonic.language.TextChunk(0, "Первая фраза.", 0, 13, "ru"),
+            com.example.supertonic.language.TextChunk(1, "Вторая фраза длиннее.", 14, 35, "ru")
+        )
+        val paragraphs = listOf(
+            com.example.supertonic.data.ParagraphItem(0, "Первая фраза. Вторая фраза длиннее.", 0, 35)
+        )
+
+        val sourceIndex = com.example.supertonic.core.SourceIndex(chunks, paragraphs, sampleRate = 44100)
+
+        // Initial estimated formatting
+        val formattedEstimated = sourceIndex.formatTimeline(0f)
+        assertTrue("Initial timeline should have approximate tilde symbol '≈'", formattedEstimated.contains("≈"))
+
+        // Update with exact synthesis duration
+        sourceIndex.updateSynthesizedChunk(0, 1.0f)
+        sourceIndex.updateSynthesizedChunk(1, 2.0f)
+
+        assertTrue("After synthesizing all chunks, should be fully synthesized", sourceIndex.isFullySynthesized())
+        val formattedExact = sourceIndex.formatTimeline(1.5f)
+        assertFalse("Exact timeline should not contain '≈'", formattedExact.contains("≈"))
+        assertEquals("00:01 / 00:03", formattedExact)
+
+        // Test paragraph search
+        val chunkForPara = sourceIndex.findChunkIndexByParagraph(0)
+        assertEquals(0, chunkForPara)
+    }
 }

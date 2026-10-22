@@ -43,6 +43,16 @@ class ModelManager(private val context: Context) {
     private val tag = "ModelManager"
     val modelDir: File = File(context.filesDir, "supertonic_model")
 
+    companion object {
+        private val cachedContentLengths = ConcurrentHashMap<String, Long>()
+        @Volatile private var lastHeadFetchTimestamp = 0L
+        private const val HEAD_TTL_MS = 7L * 24 * 60 * 60 * 1000L // 7 days
+        private const val PREFS_NAME = "supertonic_model_sizes"
+        private const val KEY_LAST_FETCH = "last_head_fetch_ts"
+    }
+
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
     private val _downloadState = MutableStateFlow<ModelDownloadState>(ModelDownloadState.NotInstalled)
     val downloadState: StateFlow<ModelDownloadState> = _downloadState.asStateFlow()
 
@@ -61,10 +71,42 @@ class ModelManager(private val context: Context) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     init {
+        // 1. Load cached sizes from SharedPreferences
+        loadCachedSizes()
+
+        // 2. Perform offline verification first without blocking on network
         checkInstalledState()
-        scope.launch {
-            fetchHeadSizes()
+
+        // 3. Launch background HEAD update only if TTL expired or never fetched
+        val now = System.currentTimeMillis()
+        val lastFetch = prefs.getLong(KEY_LAST_FETCH, 0L)
+        lastHeadFetchTimestamp = lastFetch
+        if (now - lastFetch > HEAD_TTL_MS || cachedContentLengths.isEmpty()) {
+            scope.launch {
+                fetchHeadSizes()
+            }
         }
+    }
+
+    private fun loadCachedSizes() {
+        for (desc in SupertonicConstants.MODEL_FILES) {
+            val key = "size_rev1:${desc.relativePath}"
+            val saved = prefs.getLong(key, -1L)
+            if (saved > 0) {
+                cachedContentLengths[desc.relativePath] = saved
+                headContentLengths[desc.relativePath] = saved
+            }
+        }
+        val sum = SupertonicConstants.MODEL_FILES.sumOf {
+            headContentLengths[it.relativePath] ?: it.expectedSizeBytes
+        }
+        _totalContentLengthBytes.value = sum
+    }
+
+    private fun saveCachedSize(relativePath: String, size: Long) {
+        cachedContentLengths[relativePath] = size
+        headContentLengths[relativePath] = size
+        prefs.edit().putLong("size_rev1:$relativePath", size).apply()
     }
 
     fun getVoiceStylesDir(): File = File(modelDir, "voice_styles")
@@ -78,6 +120,12 @@ class ModelManager(private val context: Context) {
     }
 
     suspend fun fetchHeadSizes(): Long = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        if (now - lastHeadFetchTimestamp < 60_000L && cachedContentLengths.size == SupertonicConstants.MODEL_FILES.size) {
+            // Already fetched recently in this process
+            return@withContext cachedContentLengths.values.sum()
+        }
+
         var sum = 0L
         var successCount = 0
         for (desc in SupertonicConstants.MODEL_FILES) {
@@ -87,27 +135,34 @@ class ModelManager(private val context: Context) {
                     if (response.isSuccessful) {
                         val cl = response.header("Content-Length")?.toLongOrNull()
                         if (cl != null && cl > 0) {
-                            headContentLengths[desc.relativePath] = cl
+                            saveCachedSize(desc.relativePath, cl)
                             sum += cl
                             successCount++
                         } else {
-                            headContentLengths[desc.relativePath] = desc.expectedSizeBytes
-                            sum += desc.expectedSizeBytes
+                            val existing = cachedContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
+                            headContentLengths[desc.relativePath] = existing
+                            sum += existing
                         }
                     } else {
-                        headContentLengths[desc.relativePath] = desc.expectedSizeBytes
-                        sum += desc.expectedSizeBytes
+                        val existing = cachedContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
+                        headContentLengths[desc.relativePath] = existing
+                        sum += existing
                     }
                 }
             } catch (e: Exception) {
-                headContentLengths[desc.relativePath] = desc.expectedSizeBytes
-                sum += desc.expectedSizeBytes
+                val existing = cachedContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
+                headContentLengths[desc.relativePath] = existing
+                sum += existing
             }
         }
         if (successCount > 0) {
+            lastHeadFetchTimestamp = now
+            prefs.edit().putLong(KEY_LAST_FETCH, now).apply()
             _totalContentLengthBytes.value = sum
         } else {
-            val manifestSum = SupertonicConstants.MODEL_FILES.sumOf { it.expectedSizeBytes }
+            val manifestSum = SupertonicConstants.MODEL_FILES.sumOf {
+                cachedContentLengths[it.relativePath] ?: it.expectedSizeBytes
+            }
             _totalContentLengthBytes.value = manifestSum
             sum = manifestSum
         }
@@ -128,13 +183,27 @@ class ModelManager(private val context: Context) {
                 _downloadState.value = ModelDownloadState.NotInstalled
                 return false
             }
-            val expected = headContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
-            // Strict verification: file size must match manifest/HEAD size, not just > 100
-            if (file.length() != expected) {
+
+            val actualLength = file.length()
+            val cachedExpected = headContentLengths[desc.relativePath] ?: cachedContentLengths[desc.relativePath]
+
+            val isValid = if (cachedExpected != null && cachedExpected > 0) {
+                actualLength == cachedExpected
+            } else {
+                // If exact HEAD size is not yet cached, tolerate minor manifest deviations <= 2%
+                val diff = Math.abs(actualLength - desc.expectedSizeBytes)
+                val tolerance = (desc.expectedSizeBytes * 0.02).toLong()
+                diff <= tolerance
+            }
+
+            // Obvious corruption: <90% or >110% of manifest
+            val isCorrupted = actualLength < (desc.expectedSizeBytes * 0.90) || actualLength > (desc.expectedSizeBytes * 1.10)
+
+            if (!isValid || isCorrupted) {
                 _downloadState.value = ModelDownloadState.Error("Файл ${desc.relativePath} поврежден, скачать заново")
                 return false
             }
-            totalSize += file.length()
+            totalSize += actualLength
         }
 
         _downloadState.value = ModelDownloadState.Ready(modelDir, totalSize)
@@ -144,8 +213,12 @@ class ModelManager(private val context: Context) {
     fun getFilesVerificationList(): List<FileVerificationItem> {
         return SupertonicConstants.MODEL_FILES.map { desc ->
             val file = File(modelDir, desc.relativePath)
-            val expected = headContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
-            val presentAndValid = file.exists() && file.length() == expected
+            val expected = headContentLengths[desc.relativePath] ?: cachedContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
+            val presentAndValid = if (file.exists()) {
+                val diff = Math.abs(file.length() - expected)
+                diff == 0L || (diff <= (expected * 0.02).toLong() && file.length() > expected * 0.90 && file.length() < expected * 1.10)
+            } else false
+
             FileVerificationItem(
                 fileName = desc.relativePath,
                 isPresent = presentAndValid,
@@ -323,6 +396,7 @@ class ModelManager(private val context: Context) {
                 // Atomic rename to final destination file
                 targetFile.delete()
                 partFile.renameTo(targetFile)
+                saveCachedSize(desc.relativePath, targetFile.length())
 
             } catch (e: Exception) {
                 Log.e(tag, "Failed downloading ${desc.relativePath}", e)

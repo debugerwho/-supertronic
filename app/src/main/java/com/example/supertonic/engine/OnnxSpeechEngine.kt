@@ -11,23 +11,27 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
 import java.text.Normalizer
-import java.util.Random
-import kotlin.math.cos
-import kotlin.math.ln
+import java.util.concurrent.ConcurrentLinkedDeque
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sqrt
 
-data class PcmSynthesisResult(
-    val pcmBytes: ByteArray,
-    val durationSeconds: Float,
+/**
+ * Diagnostic record for chunk synthesis
+ */
+data class ChunkSynthesisDiagnostic(
+    val chunkIndex: Int,
+    val textSnippet: String,
+    val durationSec: Float,
     val synthesisTimeMs: Long,
-    val sampleRate: Int,
-    val rtf: Float
+    val rtf: Float,
+    val timestamp: Long = System.currentTimeMillis()
 )
 
-class SupertonicEngine {
-    private val tag = "SupertonicEngine"
+/**
+ * Production ONNX-based speech synthesis engine conforming to Supertonic 3 model contract.
+ */
+class OnnxSpeechEngine : SpeechEngine {
+    private val tag = "OnnxSpeechEngine"
 
     private var ortEnv: OrtEnvironment? = null
     private var dpSession: OrtSession? = null
@@ -39,15 +43,27 @@ class SupertonicEngine {
     private var unicodeIndexer: LongArray? = null
     private val loadedVoiceStyles = mutableMapOf<String, VoiceStyle>()
 
+    // Ring buffer of last 20 chunk diagnostics
+    private val diagnosticsRing = ConcurrentLinkedDeque<ChunkSynthesisDiagnostic>()
+
     @Volatile
-    var isLoaded = false
+    override var isLoaded: Boolean = false
         private set
 
-    var currentThreads = 2
+    override var currentThreads: Int = 2
         private set
+
+    fun getDiagnostics(): List<ChunkSynthesisDiagnostic> = diagnosticsRing.toList()
+
+    private fun recordDiagnostic(diag: ChunkSynthesisDiagnostic) {
+        diagnosticsRing.addLast(diag)
+        while (diagnosticsRing.size > 20) {
+            diagnosticsRing.pollFirst()
+        }
+    }
 
     @Synchronized
-    fun load(modelDir: File, numThreads: Int = 2): Boolean {
+    override fun load(modelDir: File, numThreads: Int): Boolean {
         try {
             close()
             currentThreads = numThreads
@@ -58,13 +74,13 @@ class SupertonicEngine {
                 setInterOpNumThreads(1)
             }
 
-            // 1. Load config
+            // 1. Config
             val ttsJsonFile = File(modelDir, "tts.json")
             if (ttsJsonFile.exists()) {
                 config = SupertonicConfig.fromJson(ttsJsonFile.readText())
             }
 
-            // 2. Load Unicode Indexer
+            // 2. Unicode indexer
             val indexerFile = File(modelDir, "unicode_indexer.json")
             if (indexerFile.exists()) {
                 val jsonArr = JSONArray(indexerFile.readText())
@@ -75,14 +91,14 @@ class SupertonicEngine {
                 unicodeIndexer = arr
             }
 
-            // 3. Load ONNX sessions
+            // 3. ONNX Sessions
             val dpFile = File(modelDir, "duration_predictor.onnx")
             val textEncFile = File(modelDir, "text_encoder.onnx")
             val vectorEstFile = File(modelDir, "vector_estimator.onnx")
             val vocoderFile = File(modelDir, "vocoder.onnx")
 
             if (!dpFile.exists() || !textEncFile.exists() || !vectorEstFile.exists() || !vocoderFile.exists()) {
-                Log.e(tag, "One or more ONNX model files are missing in $modelDir")
+                Log.e(tag, "Missing ONNX model files in $modelDir")
                 return false
             }
 
@@ -91,7 +107,7 @@ class SupertonicEngine {
             vectorEstSession = ortEnv?.createSession(vectorEstFile.absolutePath, sessionOpts)
             vocoderSession = ortEnv?.createSession(vocoderFile.absolutePath, sessionOpts)
 
-            // 4. Load available Voice Styles
+            // 4. Voice Styles
             val stylesDir = File(modelDir, "voice_styles")
             if (stylesDir.exists()) {
                 val voiceFiles = stylesDir.listFiles { _, name -> name.endsWith(".json") }
@@ -114,35 +130,32 @@ class SupertonicEngine {
                         val style = VoiceStyle.fromJsonFile(vFile, voiceId, displayName)
                         loadedVoiceStyles[voiceId] = style
                     } catch (e: Exception) {
-                        Log.w(tag, "Failed to parse voice style $voiceId: ${e.message}")
+                        Log.w(tag, "Failed to parse voice style $voiceId", e)
                     }
                 }
             }
 
             isLoaded = dpSession != null && textEncSession != null && vectorEstSession != null && vocoderSession != null
-            Log.i(tag, "SupertonicEngine initialized with $numThreads threads. isLoaded=$isLoaded")
+            Log.i(tag, "OnnxSpeechEngine successfully initialized (threads=$numThreads, isLoaded=$isLoaded)")
             return isLoaded
         } catch (e: Exception) {
-            Log.e(tag, "Error loading SupertonicEngine", e)
+            Log.e(tag, "Error loading OnnxSpeechEngine", e)
             close()
             return false
         }
     }
 
-    fun getVoiceStyles(): List<VoiceStyle> = loadedVoiceStyles.values.toList()
+    override fun getVoiceStyles(): List<VoiceStyle> = loadedVoiceStyles.values.toList()
 
-    fun getVoiceStyle(id: String): VoiceStyle? = loadedVoiceStyles[id] ?: loadedVoiceStyles.values.firstOrNull()
+    override fun getVoiceStyle(id: String): VoiceStyle? = loadedVoiceStyles[id] ?: loadedVoiceStyles.values.firstOrNull()
 
-    /**
-     * Synthesizes a single pre-segmented text chunk into 16-bit linear PCM audio
-     */
     @Synchronized
-    fun synthesizeChunk(
+    override fun synthesizeChunk(
         rawText: String,
         lang: String,
         voiceStyle: VoiceStyle,
-        totalSteps: Int = 3,
-        speed: Float = 1.05f
+        totalSteps: Int,
+        speed: Float
     ): PcmSynthesisResult? {
         val env = ortEnv ?: return null
         val dp = dpSession ?: return null
@@ -153,7 +166,7 @@ class SupertonicEngine {
 
         val startTime = System.currentTimeMillis()
 
-        // 1. Text Preprocessing & Unicode Indexing
+        // 1. Text Preprocessing
         val processed = preprocessText(rawText, lang)
         val codePoints = processed.codePoints().toArray()
         val seqLen = max(1, codePoints.size)
@@ -164,7 +177,6 @@ class SupertonicEngine {
             textIds[i] = if (cp in indexer.indices) indexer[cp] else -1L
         }
 
-        // Tensors for Duration Predictor & Text Encoder
         val textIdsTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(textIds), longArrayOf(1, seqLen.toLong()))
         val textMaskFloats = FloatArray(seqLen) { 1.0f }
         val textMaskTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(textMaskFloats), longArrayOf(1, 1, seqLen.toLong()))
@@ -177,7 +189,7 @@ class SupertonicEngine {
         var finalLatentTensor: OnnxTensor? = null
 
         try {
-            // 2. Predict Duration
+            // 2. Duration Predictor
             val dpInputs = mapOf(
                 "text_ids" to textIdsTensor,
                 "style_dp" to styleDpTensor,
@@ -188,16 +200,14 @@ class SupertonicEngine {
             dpResult.close()
 
             val rawDuration = extractFirstFloat(dpVal)
-            val fallbackDuration = (codePoints.size / 14.0f + 0.25f).coerceIn(0.5f, 15.0f)
-
-            // Duration in seconds: use model's predicted duration with a small 180ms boundary
-            // cushion so final consonants and room decay are never abruptly cut off,
-            // while keeping latentLen strictly compact for sub-second real-time inference.
-            val duration = if (rawDuration != null && rawDuration > 0.05f) {
-                (rawDuration * 1.05f + 0.18f).coerceIn(0.4f, 15.0f)
-            } else {
-                fallbackDuration
+            if (rawDuration == null || rawDuration <= 0.01f) {
+                Log.e(tag, "Duration predictor output is invalid ($rawDuration) for phrase '$rawText'")
+                return null
             }
+
+            // Model contract: duration = duration_predictor_output / speed
+            val effectiveSpeed = speed.coerceIn(0.2f, 3.0f)
+            val duration = rawDuration / effectiveSpeed
 
             // 3. Text Encoder
             val textEncInputs = mapOf(
@@ -207,30 +217,29 @@ class SupertonicEngine {
             )
             val textEncResult = textEnc.run(textEncInputs)
             textEmbTensor = textEncResult.get(0) as OnnxTensor
+            textEncResult.close()
 
-            // 4. Sample Noisy Latent via Box-Muller Gaussian
+            // 4. Sample Noisy Latent via ThreadLocalRandom Gaussian
             val sampleRate = config.sampleRate
             val chunkSize = config.chunkSize
             val wavLenMax = (duration * sampleRate).toLong()
             val latentLen = max(1, ((wavLenMax + chunkSize - 1) / chunkSize).toInt())
             val latentDim = config.totalLatentDim // 144
 
-            Log.d(tag, "Inference for chunk: length=${codePoints.size} chars, duration=${duration}s, latentLen=$latentLen, steps=$totalSteps")
-
             val totalLatentElements = latentDim * latentLen
             val noisyLatentFloats = FloatArray(totalLatentElements)
-            val rng = Random()
+            val rng = java.util.concurrent.ThreadLocalRandom.current()
             for (i in 0 until totalLatentElements) {
-                val u1 = max(1e-10, rng.nextDouble())
-                val u2 = rng.nextDouble()
-                noisyLatentFloats[i] = (sqrt(-2.0 * ln(u1)) * cos(2.0 * Math.PI * u2)).toFloat()
+                noisyLatentFloats[i] = rng.nextGaussian().toFloat()
             }
 
-            val latentMaskFloats = FloatArray(latentLen) { 1.0f }
+            // Latent mask built from wav_lengths (active chunks 1.0f, padding 0.0f)
+            val latentMaskFloats = FloatArray(latentLen) { idx ->
+                if (idx.toLong() * chunkSize < wavLenMax) 1.0f else 0.0f
+            }
 
             // 5. Flow Matching Denoising Loop
             totalStepTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(totalSteps.toFloat())), longArrayOf(1))
-
             var currentLatentFloats = noisyLatentFloats
 
             for (step in 0 until totalSteps) {
@@ -252,7 +261,6 @@ class SupertonicEngine {
                 val vectorEstResult = vectorEst.run(vectorEstInputs)
                 val denoisedVal = vectorEstResult.get(0).value
 
-                // Extract denoised latent
                 if (denoisedVal is Array<*>) {
                     val batch = denoisedVal[0] as Array<*>
                     var fIdx = 0
@@ -279,28 +287,28 @@ class SupertonicEngine {
             vocoderResult.close()
 
             val rawSamples: FloatArray = extractFloatArray(wavBatch)
-
-            // Preserve 100% of vocoder output samples with natural room decay
-            val targetSampleCount = if (rawSamples.isNotEmpty()) {
-                rawSamples.size
-            } else {
-                (duration * sampleRate).toInt()
+            if (rawSamples.isEmpty()) {
+                Log.e(tag, "Vocoder produced empty samples for chunk '$rawText'")
+                return null
             }
 
+            val targetSampleCount = rawSamples.size
             val pcmBytes = ByteArray(targetSampleCount * 2)
             val pcmBuf = ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN)
 
-            // Gentle 10ms edge de-click so trailing consonants and endings are 100% audible
-            val fadeLength = min(targetSampleCount / 16, (sampleRate * 0.01f).toInt())
+            // Fade-in/out <= 3 ms per contract
+            val maxFadeSamples = (sampleRate * 0.003f).toInt()
+            val fadeLength = min(targetSampleCount / 4, maxFadeSamples)
 
             for (i in 0 until targetSampleCount) {
-                var sample = if (i < rawSamples.size) rawSamples[i] else 0f
-                // Smooth edge transitions to prevent pops
-                if (i < fadeLength) {
-                    sample *= (i.toFloat() / fadeLength)
-                } else if (i >= targetSampleCount - fadeLength) {
-                    val remaining = targetSampleCount - 1 - i
-                    sample *= (remaining.toFloat() / fadeLength)
+                var sample = rawSamples[i]
+                if (fadeLength > 0) {
+                    if (i < fadeLength) {
+                        sample *= (i.toFloat() / fadeLength)
+                    } else if (i >= targetSampleCount - fadeLength) {
+                        val remaining = targetSampleCount - 1 - i
+                        sample *= (remaining.toFloat() / fadeLength)
+                    }
                 }
                 val clamped = max(-32768, min(32767, (sample * 32767.0f).toInt()))
                 pcmBuf.putShort(clamped.toShort())
@@ -310,13 +318,25 @@ class SupertonicEngine {
             val actualDuration = targetSampleCount.toFloat() / sampleRate.toFloat()
             val rtf = if (actualDuration > 0) (elapsedMs / 1000.0f) / actualDuration else 1.0f
 
-            return PcmSynthesisResult(
+            val result = PcmSynthesisResult(
                 pcmBytes = pcmBytes,
                 durationSeconds = actualDuration,
                 synthesisTimeMs = elapsedMs,
                 sampleRate = sampleRate,
                 rtf = rtf
             )
+
+            recordDiagnostic(
+                ChunkSynthesisDiagnostic(
+                    chunkIndex = 0,
+                    textSnippet = rawText.take(30),
+                    durationSec = actualDuration,
+                    synthesisTimeMs = elapsedMs,
+                    rtf = rtf
+                )
+            )
+
+            return result
 
         } catch (e: Exception) {
             Log.e(tag, "Inference error on chunk '$rawText'", e)
@@ -405,8 +425,6 @@ class SupertonicEngine {
         return sb.toString()
     }
 
-    fun isLoadedWithThreads(threads: Int): Boolean = isLoaded && currentThreads == threads
-
     private fun extractFirstFloat(value: Any?): Float? {
         return when (value) {
             null -> null
@@ -445,7 +463,7 @@ class SupertonicEngine {
     }
 
     @Synchronized
-    fun close() {
+    override fun close() {
         try {
             dpSession?.close()
             textEncSession?.close()
@@ -453,7 +471,7 @@ class SupertonicEngine {
             vocoderSession?.close()
             ortEnv?.close()
         } catch (e: Exception) {
-            Log.w(tag, "Exception during engine close", e)
+            Log.w(tag, "Exception during OnnxSpeechEngine close", e)
         } finally {
             dpSession = null
             textEncSession = null

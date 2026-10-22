@@ -22,9 +22,16 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.supertonic.audio.AudioTrackSink
+import com.example.supertonic.audio.PcmRing
+import com.example.supertonic.audio.PlaybackClock
+import com.example.supertonic.audio.SynthesisScheduler
+import com.example.supertonic.core.SourceIndex
+import com.example.supertonic.data.ParagraphItem
 import com.example.supertonic.engine.CpuAffinityManager
+import com.example.supertonic.engine.EngineHost
 import com.example.supertonic.engine.ModelManager
-import com.example.supertonic.engine.SupertonicEngine
+import com.example.supertonic.engine.SpeechEngine
 import com.example.supertonic.language.TextChunk
 import com.example.supertonic.language.TextSegmenter
 import kotlinx.coroutines.*
@@ -32,7 +39,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 enum class PlaybackStatus {
@@ -49,9 +55,14 @@ data class PlaybackState(
     val status: PlaybackStatus = PlaybackStatus.IDLE,
     val currentChunkIndex: Int = 0,
     val totalChunks: Int = 0,
+    val currentParagraphIndex: Int = 0,
     val currentSentenceText: String = "",
     val currentSentenceStart: Int = 0,
     val currentSentenceEnd: Int = 0,
+    val timelineDisplay: String = "00:00 / 00:00",
+    val playbackProgress: Float = 0f,
+    val currentSeconds: Float = 0f,
+    val totalEstimatedSeconds: Float = 0f,
     val bufferedSeconds: Float = 0f,
     val rtf: Float = 1.0f,
     val underruns: Int = 0,
@@ -87,7 +98,6 @@ class SupertonicPlaybackService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var prepJob: Job? = null
-    private var synthesisJob: Job? = null
     private var playbackJob: Job? = null
     private var batchExportJob: Job? = null
 
@@ -95,22 +105,28 @@ class SupertonicPlaybackService : Service() {
     private lateinit var powerManager: PowerManager
     private var wakeLock: PowerManager.WakeLock? = null
     private var mediaSession: MediaSessionCompat? = null
+    private var currentFocusRequest: AudioFocusRequest? = null
 
-    val engine = SupertonicEngine()
+    val engine: SpeechEngine get() = EngineHost.rawEngine
     lateinit var modelManager: ModelManager
         private set
     lateinit var cpuAffinity: CpuAffinityManager
         private set
-    private var audioTrackPlayer = AudioTrackPlayer()
     lateinit var overlayManager: FloatingOverlayManager
         private set
+
+    val pcmRing = PcmRing()
+    val sink = AudioTrackSink(sampleRate = 44100)
+    val clock = PlaybackClock(sink, 44100)
+    private lateinit var scheduler: SynthesisScheduler
+
+    private var sourceIndex: SourceIndex? = null
 
     private val _playbackState = MutableStateFlow(PlaybackState())
     val playbackState: StateFlow<PlaybackState> = _playbackState.asStateFlow()
 
     private val generationId = AtomicInteger(0)
     private var activeChunks: List<TextChunk> = emptyList()
-    private val sessionChunkMap = ConcurrentHashMap<Int, PcmChunk>()
 
     @Volatile
     private var activeVoiceId: String = "F1"
@@ -151,9 +167,31 @@ class SupertonicPlaybackService : Service() {
         cpuAffinity = CpuAffinityManager(this)
         overlayManager = FloatingOverlayManager(this, this)
 
-        // One-time startup cleanup of leftover old pcm files in cacheDir
-        cleanLegacyPcmFiles()
+        scheduler = SynthesisScheduler(pcmRing, serviceScope).apply {
+            onChunkSynthesized = { chunkIndex, durationSec, rtf ->
+                sourceIndex?.updateSynthesizedChunk(chunkIndex, durationSec)
+                val total = activeChunks.size
+                val synthList = List(total) { idx -> pcmRing.isReady(idx) }
+                val curSec = clock.currentSeconds
+                val timeline = sourceIndex?.formatTimeline(curSec) ?: "00:00 / 00:00"
 
+                _playbackState.value = _playbackState.value.copy(
+                    rtf = rtf,
+                    synthesizedChunksCount = synthList.count { it },
+                    isChunkSynthesized = synthList,
+                    timelineDisplay = timeline,
+                    totalEstimatedSeconds = sourceIndex?.getTotalEstimatedDurationSeconds() ?: 0f
+                )
+            }
+            onSynthesisError = { chunkIndex, errorMsg ->
+                _playbackState.value = _playbackState.value.copy(
+                    status = PlaybackStatus.ERROR,
+                    errorMessage = errorMsg
+                )
+            }
+        }
+
+        cleanLegacyPcmFiles()
         createNotificationChannel()
         setupMediaSession()
 
@@ -202,19 +240,20 @@ class SupertonicPlaybackService : Service() {
         steps: Int = 3,
         speed: Float = 1.0f,
         startIndex: Int = 0,
-        showOverlay: Boolean = false
+        showOverlay: Boolean = false,
+        paragraphs: List<ParagraphItem> = emptyList()
     ) {
         val currentGen = generationId.incrementAndGet()
         prepJob?.cancel()
-        synthesisJob?.cancel()
         playbackJob?.cancel()
-        audioTrackPlayer.stop()
+        scheduler.cancelAll()
+        sink.stop()
+        pcmRing.clear()
 
         activeLang = lang
         activeVoiceId = voiceId
         activeSteps = steps
         setPlaybackSpeed(speed)
-        sessionChunkMap.clear()
 
         _playbackState.value = PlaybackState(
             status = PlaybackStatus.PREPARING,
@@ -226,7 +265,7 @@ class SupertonicPlaybackService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification("Подготовка озвучивания...", false))
 
         prepJob = serviceScope.launch(Dispatchers.Default) {
-            if (!engine.isLoaded) {
+            if (!EngineHost.isLoaded.value) {
                 if (!modelManager.checkInstalledState()) {
                     withContext(Dispatchers.Main) {
                         _playbackState.value = _playbackState.value.copy(
@@ -238,7 +277,7 @@ class SupertonicPlaybackService : Service() {
                     return@launch
                 }
                 val threads = cpuAffinity.getActiveThreadCount()
-                val loaded = engine.load(modelManager.modelDir, numThreads = threads)
+                val loaded = EngineHost.load(modelManager.modelDir, numThreads = threads)
                 if (!loaded) {
                     withContext(Dispatchers.Main) {
                         _playbackState.value = _playbackState.value.copy(
@@ -251,7 +290,6 @@ class SupertonicPlaybackService : Service() {
                 }
             }
 
-            // Segmentation in Dispatchers.Default
             val chunks = TextSegmenter.segment(text, defaultLang = lang, priorityRussian = true)
             if (chunks.isEmpty()) {
                 withContext(Dispatchers.Main) {
@@ -262,8 +300,10 @@ class SupertonicPlaybackService : Service() {
             }
             activeChunks = chunks
 
-            // Strict voice checking - no silent fallback
-            val voice = engine.getVoiceStyle(voiceId)
+            val index = SourceIndex(chunks, paragraphs)
+            sourceIndex = index
+
+            val voice = EngineHost.getVoiceStyle(voiceId)
             if (voice == null) {
                 withContext(Dispatchers.Main) {
                     _playbackState.value = _playbackState.value.copy(
@@ -274,6 +314,8 @@ class SupertonicPlaybackService : Service() {
                 }
                 return@launch
             }
+
+            scheduler.updateContext(chunks, voice, steps)
 
             withContext(Dispatchers.Main) {
                 if (!requestAudioFocus()) {
@@ -290,25 +332,31 @@ class SupertonicPlaybackService : Service() {
                 }
 
                 val initialChunk = chunks.getOrElse(startIndex) { chunks.first() }
+                val span = index.getSpan(initialChunk.index)
+
                 _playbackState.value = PlaybackState(
                     status = PlaybackStatus.BUFFERING,
                     currentChunkIndex = initialChunk.index,
                     totalChunks = chunks.size,
+                    currentParagraphIndex = span?.paragraphIndex ?: 0,
                     currentSentenceText = initialChunk.text,
                     currentSentenceStart = initialChunk.startOffset,
                     currentSentenceEnd = initialChunk.endOffset,
+                    timelineDisplay = index.formatTimeline(0f),
+                    totalEstimatedSeconds = index.getTotalEstimatedDurationSeconds(),
                     playbackSpeed = speed,
                     isChunkSynthesized = List(chunks.size) { false }
                 )
 
-                startSynthesisAndPlaybackPipes(currentGen, startIndex, voice)
+                scheduler.scheduleAround(startIndex)
+                startPlaybackLoop(currentGen, startIndex)
             }
         }
     }
 
     fun retrySynthesis() {
         val currentChunk = _playbackState.value.currentChunkIndex
-        val voice = engine.getVoiceStyle(activeVoiceId)
+        val voice = EngineHost.getVoiceStyle(activeVoiceId)
         if (voice == null) {
             _playbackState.value = _playbackState.value.copy(
                 status = PlaybackStatus.ERROR,
@@ -317,16 +365,21 @@ class SupertonicPlaybackService : Service() {
             return
         }
         val currentGen = generationId.incrementAndGet()
-        synthesisJob?.cancel()
         playbackJob?.cancel()
-        audioTrackPlayer.flush()
+        sink.flush()
 
         _playbackState.value = _playbackState.value.copy(
             status = PlaybackStatus.BUFFERING,
             errorMessage = null
         )
         acquireWakeLock()
-        startSynthesisAndPlaybackPipes(currentGen, currentChunk, voice)
+        scheduler.scheduleAround(currentChunk, userSeekTarget = currentChunk)
+        startPlaybackLoop(currentGen, currentChunk)
+    }
+
+    fun seekToParagraph(paragraphIndex: Int) {
+        val targetChunk = sourceIndex?.findChunkIndexByParagraph(paragraphIndex) ?: 0
+        seekToChunk(targetChunk)
     }
 
     fun seekToChunk(targetIndex: Int) {
@@ -335,7 +388,7 @@ class SupertonicPlaybackService : Service() {
         val clampedIndex = targetIndex.coerceIn(0, total - 1)
 
         val targetChunk = activeChunks[clampedIndex]
-        val voice = engine.getVoiceStyle(activeVoiceId)
+        val voice = EngineHost.getVoiceStyle(activeVoiceId)
         if (voice == null) {
             _playbackState.value = _playbackState.value.copy(
                 status = PlaybackStatus.ERROR,
@@ -344,128 +397,38 @@ class SupertonicPlaybackService : Service() {
             return
         }
 
-        val cached = sessionChunkMap[clampedIndex]
-        if (cached != null) {
-            val currentGen = generationId.incrementAndGet()
-            playbackJob?.cancel()
-            audioTrackPlayer.flush()
+        val currentGen = generationId.incrementAndGet()
+        playbackJob?.cancel()
+        sink.flush()
 
-            _playbackState.value = _playbackState.value.copy(
-                status = PlaybackStatus.PLAYING,
-                currentChunkIndex = clampedIndex,
-                currentSentenceText = targetChunk.text,
-                currentSentenceStart = targetChunk.startOffset,
-                currentSentenceEnd = targetChunk.endOffset
-            )
-            acquireWakeLock()
-            startPlaybackLoop(currentGen, clampedIndex)
-        } else {
-            val currentGen = generationId.incrementAndGet()
-            synthesisJob?.cancel()
-            playbackJob?.cancel()
-            audioTrackPlayer.flush()
+        val span = sourceIndex?.getSpan(clampedIndex)
+        span?.let { clock.resetToSample(it.sampleStart) }
 
-            _playbackState.value = _playbackState.value.copy(
-                status = PlaybackStatus.BUFFERING,
-                currentChunkIndex = clampedIndex,
-                currentSentenceText = targetChunk.text,
-                currentSentenceStart = targetChunk.startOffset,
-                currentSentenceEnd = targetChunk.endOffset
-            )
-            acquireWakeLock()
-            startSynthesisAndPlaybackPipes(currentGen, clampedIndex, voice)
-        }
-    }
+        val isReady = pcmRing.isReady(clampedIndex)
+        _playbackState.value = _playbackState.value.copy(
+            status = if (isReady) PlaybackStatus.PLAYING else PlaybackStatus.BUFFERING,
+            currentChunkIndex = clampedIndex,
+            currentParagraphIndex = span?.paragraphIndex ?: 0,
+            currentSentenceText = targetChunk.text,
+            currentSentenceStart = targetChunk.startOffset,
+            currentSentenceEnd = targetChunk.endOffset
+        )
+        acquireWakeLock()
 
-    private fun startSynthesisAndPlaybackPipes(
-        currentGen: Int,
-        startIndex: Int,
-        voice: com.example.supertonic.engine.VoiceStyle
-    ) {
-        synthesisJob = serviceScope.launch(Dispatchers.Default) {
-            try {
-                val chunksOrder = mutableListOf<TextChunk>()
-                for (i in startIndex until activeChunks.size) {
-                    chunksOrder.add(activeChunks[i])
-                }
-                for (i in 0 until startIndex) {
-                    chunksOrder.add(activeChunks[i])
-                }
-
-                for (chunk in chunksOrder) {
-                    if (generationId.get() != currentGen) break
-                    if (sessionChunkMap.containsKey(chunk.index)) continue
-
-                    val synthResult = try {
-                        engine.synthesizeChunk(
-                            rawText = chunk.text,
-                            lang = chunk.resolvedLang,
-                            voiceStyle = voice,
-                            totalSteps = activeSteps,
-                            speed = 1.0f
-                        )
-                    } catch (e: Exception) {
-                        Log.e(tag, "synthesizeChunk failed on phrase ${chunk.index + 1}", e)
-                        null
-                    }
-
-                    if (synthResult == null) {
-                        withContext(Dispatchers.Main) {
-                            _playbackState.value = _playbackState.value.copy(
-                                status = PlaybackStatus.ERROR,
-                                errorMessage = "Ошибка синтеза фразы №${chunk.index + 1}"
-                            )
-                        }
-                        return@launch
-                    }
-
-                    val pcmChunk = PcmChunk(
-                        index = chunk.index,
-                        pcmBytes = synthResult.pcmBytes,
-                        durationSec = synthResult.durationSeconds,
-                        text = chunk.text,
-                        startOffset = chunk.startOffset,
-                        endOffset = chunk.endOffset,
-                        sampleRate = 44100
-                    )
-                    sessionChunkMap[chunk.index] = pcmChunk
-
-                    withContext(Dispatchers.Main) {
-                        val synthList = List(activeChunks.size) { idx -> sessionChunkMap.containsKey(idx) }
-                        _playbackState.value = _playbackState.value.copy(
-                            rtf = synthResult.rtf,
-                            synthesizedChunksCount = sessionChunkMap.size,
-                            isChunkSynthesized = synthList
-                        )
-                    }
-                }
-            } catch (e: CancellationException) {
-                // Cancelled
-            } catch (e: Exception) {
-                Log.e(tag, "Synthesis loop error", e)
-                withContext(Dispatchers.Main) {
-                    _playbackState.value = _playbackState.value.copy(
-                        status = PlaybackStatus.ERROR,
-                        errorMessage = "Сбой синтеза: ${e.localizedMessage ?: "Неизвестная ошибка"}"
-                    )
-                }
-            }
-        }
-
-        startPlaybackLoop(currentGen, startIndex)
+        scheduler.scheduleAround(clampedIndex, userSeekTarget = clampedIndex)
+        startPlaybackLoop(currentGen, clampedIndex)
     }
 
     private fun startPlaybackLoop(currentGen: Int, startIndex: Int) {
+        playbackJob?.cancel()
         playbackJob = serviceScope.launch(Dispatchers.IO) {
             try {
-                audioTrackPlayer.play()
+                sink.play()
                 var currentIndex = startIndex
 
-                while (currentIndex < activeChunks.size) {
-                    if (generationId.get() != currentGen) break
-
-                    var chunk = sessionChunkMap[currentIndex]
-                    while (chunk == null && generationId.get() == currentGen) {
+                while (currentIndex < activeChunks.size && generationId.get() == currentGen) {
+                    var chunkPcm = pcmRing.getChunk(currentIndex)
+                    while (chunkPcm == null && generationId.get() == currentGen) {
                         if (_playbackState.value.status == PlaybackStatus.ERROR) {
                             return@launch
                         }
@@ -474,47 +437,70 @@ class SupertonicPlaybackService : Service() {
                                 _playbackState.value = _playbackState.value.copy(status = PlaybackStatus.BUFFERING)
                             }
                         }
-                        delay(50)
-                        chunk = sessionChunkMap[currentIndex]
+                        delay(40)
+                        chunkPcm = pcmRing.getChunk(currentIndex)
                     }
 
-                    if (chunk == null || generationId.get() != currentGen) break
+                    if (chunkPcm == null || generationId.get() != currentGen) break
 
-                    while (audioTrackPlayer.getBufferedDurationSeconds() > 1.2f && generationId.get() == currentGen) {
-                        delay(60)
-                    }
-
-                    if (generationId.get() != currentGen) break
+                    val chunk = activeChunks[currentIndex]
+                    val span = sourceIndex?.getSpan(currentIndex)
 
                     withContext(Dispatchers.Main) {
+                        pcmRing.advance(currentIndex, activeChunks)
+                        scheduler.scheduleAround(currentIndex)
+
+                        val curSec = clock.currentSeconds
+                        val totalSec = sourceIndex?.getTotalEstimatedDurationSeconds() ?: 1f
+                        val progress = (curSec / totalSec).coerceIn(0f, 1f)
+                        val timeline = sourceIndex?.formatTimeline(curSec) ?: "00:00 / 00:00"
+
                         _playbackState.value = _playbackState.value.copy(
                             status = PlaybackStatus.PLAYING,
                             currentChunkIndex = chunk.index,
+                            currentParagraphIndex = span?.paragraphIndex ?: 0,
                             currentSentenceText = chunk.text,
                             currentSentenceStart = chunk.startOffset,
                             currentSentenceEnd = chunk.endOffset,
-                            bufferedSeconds = audioTrackPlayer.getBufferedDurationSeconds(),
-                            underruns = audioTrackPlayer.getUnderruns()
+                            timelineDisplay = timeline,
+                            currentSeconds = curSec,
+                            playbackProgress = progress,
+                            bufferedSeconds = sink.getBufferedDurationSeconds(),
+                            underruns = sink.getUnderruns()
                         )
                         updateNotificationThrottled(chunk.text, true)
                     }
 
-                    audioTrackPlayer.write(chunk.pcmBytes)
+                    // Write audio chunk in <= 100 ms slices
+                    var writeOffset = 0
+                    while (writeOffset < chunkPcm.size && generationId.get() == currentGen) {
+                        val remaining = chunkPcm.size - writeOffset
+                        val written = sink.writeSlice(chunkPcm, writeOffset, remaining)
+                        if (written > 0) {
+                            writeOffset += written
+                        } else {
+                            delay(20)
+                        }
+                    }
+
                     currentIndex++
                 }
 
-                while (audioTrackPlayer.getBufferedDurationSeconds() > 0.05f && generationId.get() == currentGen && audioTrackPlayer.isPlaying) {
-                    delay(50)
+                // Buffer drain
+                while (sink.getBufferedDurationSeconds() > 0.05f && generationId.get() == currentGen && sink.isPlaying) {
+                    delay(40)
                 }
 
                 withContext(Dispatchers.Main) {
-                    if (generationId.get() == currentGen) {
+                    if (generationId.get() == currentGen && currentIndex >= activeChunks.size) {
                         _playbackState.value = _playbackState.value.copy(
                             status = PlaybackStatus.COMPLETED,
-                            bufferedSeconds = 0f
+                            bufferedSeconds = 0f,
+                            playbackProgress = 1.0f
                         )
                         updateNotificationThrottled("Чтение завершено", false, force = true)
                         releaseWakeLock()
+                        abandonAudioFocus()
                     }
                 }
             } catch (e: CancellationException) {
@@ -544,12 +530,27 @@ class SupertonicPlaybackService : Service() {
                     return@launch
                 }
 
-                if (!engine.isLoaded) {
-                    val threads = cpuAffinity.getActiveThreadCount()
-                    engine.load(modelManager.modelDir, numThreads = threads)
+                // RAM safety check before batch export (> 400 MB)
+                val totalChars = chunks.sumOf { it.text.length }
+                val estimatedSec = totalChars / 12.0
+                val estimatedPcmBytes = (estimatedSec * 44100 * 2).toLong()
+                if (estimatedPcmBytes > 400L * 1024 * 1024) {
+                    val estMin = (estimatedSec / 60.0).toInt()
+                    withContext(Dispatchers.Main) {
+                        onComplete(
+                            false,
+                            "Размер аудио (~$estMin мин) превышает лимит RAM (400 МБ). Пожалуйста, экспортируйте текст по главам."
+                        )
+                    }
+                    return@launch
                 }
 
-                val voice = engine.getVoiceStyle(voiceId)
+                if (!EngineHost.isLoaded.value) {
+                    val threads = cpuAffinity.getActiveThreadCount()
+                    EngineHost.load(modelManager.modelDir, numThreads = threads)
+                }
+
+                val voice = EngineHost.getVoiceStyle(voiceId)
                 if (voice == null) {
                     withContext(Dispatchers.Main) { onComplete(false, "Голос '$voiceId' не найден") }
                     return@launch
@@ -558,14 +559,17 @@ class SupertonicPlaybackService : Service() {
                 val pcmChunks = mutableListOf<ByteArray>()
 
                 for ((idx, chunk) in chunks.withIndex()) {
-                    val synth = engine.synthesizeChunk(
-                        rawText = chunk.text,
-                        lang = chunk.resolvedLang,
-                        voiceStyle = voice,
-                        totalSteps = steps,
-                        speed = 1.0f
-                    )
+                    val synth = EngineHost.withEngine { eng: SpeechEngine ->
+                        eng.synthesizeChunk(
+                            rawText = chunk.text,
+                            lang = chunk.resolvedLang,
+                            voiceStyle = voice,
+                            totalSteps = steps,
+                            speed = 1.0f
+                        )
+                    }
                     if (synth == null) {
+                        if (targetFile.exists()) targetFile.delete()
                         withContext(Dispatchers.Main) {
                             onComplete(false, "Ошибка синтеза чанка ${idx + 1}")
                         }
@@ -579,7 +583,7 @@ class SupertonicPlaybackService : Service() {
                     }
                 }
 
-                // Encode directly to destination file without temporary files on disk
+                // Direct encode to targetFile without temporary files
                 val success = if (format == "m4a") {
                     MediaCodecExporter.encodePcmChunksToM4a(pcmChunks, targetFile) { p ->
                         serviceScope.launch(Dispatchers.Main) {
@@ -590,11 +594,21 @@ class SupertonicPlaybackService : Service() {
                     MediaCodecExporter.convertPcmChunksToWav(pcmChunks, targetFile)
                 }
 
+                if (!success && targetFile.exists()) {
+                    targetFile.delete()
+                }
+
                 withContext(Dispatchers.Main) {
                     onProgress(1.0f)
                     onComplete(success, if (success) null else "Сбой кодирования аудиофайла")
                 }
+            } catch (e: CancellationException) {
+                if (targetFile.exists()) targetFile.delete()
+                withContext(Dispatchers.Main) {
+                    onComplete(false, "Экспорт отменен")
+                }
             } catch (e: Exception) {
+                if (targetFile.exists()) targetFile.delete()
                 Log.e(tag, "Batch export error", e)
                 withContext(Dispatchers.Main) {
                     onComplete(false, e.localizedMessage ?: "Сбой генерации")
@@ -604,13 +618,13 @@ class SupertonicPlaybackService : Service() {
     }
 
     fun setPlaybackSpeed(speed: Float) {
-        audioTrackPlayer.playbackSpeed = speed
+        sink.playbackSpeed = speed
         _playbackState.value = _playbackState.value.copy(playbackSpeed = speed)
     }
 
     fun pause() {
         playbackJob?.cancel()
-        audioTrackPlayer.pause()
+        sink.pause()
         releaseWakeLock()
 
         _playbackState.value = _playbackState.value.copy(status = PlaybackStatus.PAUSED)
@@ -629,10 +643,12 @@ class SupertonicPlaybackService : Service() {
 
     fun stop() {
         prepJob?.cancel()
-        synthesisJob?.cancel()
         playbackJob?.cancel()
-        audioTrackPlayer.stop()
+        scheduler.cancelAll()
+        sink.stop()
+        pcmRing.clear()
         releaseWakeLock()
+        abandonAudioFocus()
 
         _playbackState.value = _playbackState.value.copy(
             status = PlaybackStatus.IDLE,
@@ -651,9 +667,11 @@ class SupertonicPlaybackService : Service() {
     }
 
     fun jumpSeconds(deltaSec: Int) {
-        val deltaChunks = (deltaSec / 3).coerceAtLeast(1)
-        val target = if (deltaSec > 0) _playbackState.value.currentChunkIndex + deltaChunks else _playbackState.value.currentChunkIndex - deltaChunks
-        seekToChunk(target)
+        val curSec = clock.currentSeconds
+        val targetSec = maxOf(0f, curSec + deltaSec)
+        val targetSample = (targetSec * 44100).toLong()
+        val targetChunk = sourceIndex?.findChunkIndexBySample(targetSample) ?: 0
+        seekToChunk(targetChunk)
     }
 
     private fun acquireWakeLock() {
@@ -689,9 +707,21 @@ class SupertonicPlaybackService : Service() {
             .setAudioAttributes(audioAttributes)
             .setOnAudioFocusChangeListener(audioFocusChangeListener)
             .build()
+        currentFocusRequest = request
 
         val result = audioManager.requestAudioFocus(request)
         return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    }
+
+    private fun abandonAudioFocus() {
+        try {
+            currentFocusRequest?.let {
+                audioManager.abandonAudioFocusRequest(it)
+                currentFocusRequest = null
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "abandonAudioFocus error", e)
+        }
     }
 
     private fun setupMediaSession() {
@@ -798,10 +828,10 @@ class SupertonicPlaybackService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         stop()
+        abandonAudioFocus()
         unregisterReceiver(noisyReceiver)
         mediaSession?.release()
-        audioTrackPlayer.release()
-        engine.close()
+        sink.release()
         serviceScope.cancel()
     }
 }
