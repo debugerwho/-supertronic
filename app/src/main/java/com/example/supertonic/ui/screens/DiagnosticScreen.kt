@@ -37,11 +37,6 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
     val playbackState by viewModel.servicePlaybackState.collectAsState()
     val cores by viewModel.availableCores.collectAsState()
 
-    var cacheSizeBytes by remember { mutableStateOf(0L) }
-    LaunchedEffect(Unit) {
-        cacheSizeBytes = calculatePcmCacheSize(context)
-    }
-
     val scrollState = rememberScrollState()
 
     Scaffold(
@@ -78,20 +73,21 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                     }
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    val cores = Runtime.getRuntime().availableProcessors()
+                    val cpuCores = Runtime.getRuntime().availableProcessors()
                     val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
                     val device = "${Build.MANUFACTURER} ${Build.MODEL}"
 
                     DiagnosticRow("Модель смартфона", device)
                     DiagnosticRow("Архитектура (ABI)", abi)
-                    DiagnosticRow("Число ядер CPU", "$cores ядер")
+                    DiagnosticRow("Число ядер CPU", "$cpuCores ядер")
                     DiagnosticRow("Версия Android", "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+                    DiagnosticRow("Потоки инференса (engine.currentThreads)", "${viewModel.currentEngineThreads}")
                     DiagnosticRow("Текущий RTF синтеза", String.format("%.2f", playbackState.rtf))
                     DiagnosticRow("Счетчик опустошений (Underruns)", "${playbackState.underruns}")
                 }
             }
 
-            // 2. CPU Core Affinity Card (Winlator-style 8-core selector)
+            // 2. Inference Threads Card (formerly Core Affinity)
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -103,11 +99,11 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Icon(Icons.Default.DeveloperBoard, contentDescription = null, tint = CoralPrimary)
-                        Text("Привязка ядер CPU (Core Affinity)", fontWeight = FontWeight.Bold, color = TextPrimary, fontSize = 15.sp)
+                        Text("Потоки инференса", fontWeight = FontWeight.Bold, color = TextPrimary, fontSize = 15.sp)
                     }
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "Управление маской ядер для инференса. Для Helio G99: ядра 6-7 (Cortex-A76 Big) дают максимальную скорость, ядра 0-5 (Cortex-A55 Little) — энергосбережение.",
+                        text = "Фактическое число рабочих потоков ONNX: ${viewModel.currentEngineThreads}. Выбор чекбоксов влияет на число потоков; привязка к ядрам в этой сборке не реализована.",
                         color = TextSecondary,
                         fontSize = 12.sp,
                         lineHeight = 18.sp
@@ -123,7 +119,7 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                         FilterChip(
                             selected = false,
                             onClick = { viewModel.applyCpuPreset(CpuPreset.ALL_CORES) },
-                            label = { Text("Все ядра", fontSize = 11.sp) },
+                            label = { Text("Все потоки", fontSize = 11.sp) },
                             colors = FilterChipDefaults.filterChipColors(
                                 labelColor = TextPrimary,
                                 containerColor = ObsidianElevated
@@ -132,7 +128,7 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                         FilterChip(
                             selected = false,
                             onClick = { viewModel.applyCpuPreset(CpuPreset.PERFORMANCE_ONLY) },
-                            label = { Text("Big Cores (6-7)", fontSize = 11.sp) },
+                            label = { Text("2 потока", fontSize = 11.sp) },
                             colors = FilterChipDefaults.filterChipColors(
                                 labelColor = CoralPrimary,
                                 containerColor = ObsidianElevated
@@ -141,7 +137,7 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                         FilterChip(
                             selected = false,
                             onClick = { viewModel.applyCpuPreset(CpuPreset.EFFICIENCY_ONLY) },
-                            label = { Text("Little (0-5)", fontSize = 11.sp) },
+                            label = { Text("4 потока", fontSize = 11.sp) },
                             colors = FilterChipDefaults.filterChipColors(
                                 labelColor = MintVoice,
                                 containerColor = ObsidianElevated
@@ -151,7 +147,7 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
 
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    // 8-core grid
+                    // Cores / threads grid
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         cores.chunked(2).forEach { rowCores ->
                             Row(
@@ -163,9 +159,7 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                                         modifier = Modifier
                                             .weight(1f)
                                             .clip(RoundedCornerShape(8.dp)),
-                                        color = if (core.isEnabled) {
-                                            if (core.isPerformanceCore) CoralPrimary.copy(alpha = 0.2f) else MintVoice.copy(alpha = 0.2f)
-                                        } else ObsidianElevated
+                                        color = if (core.isEnabled) CoralPrimary.copy(alpha = 0.2f) else ObsidianElevated
                                     ) {
                                         Row(
                                             modifier = Modifier
@@ -176,15 +170,15 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                                         ) {
                                             Column {
                                                 Text(
-                                                    text = "Ядро ${core.id}",
+                                                    text = "Поток/ядро ${core.id}",
                                                     fontWeight = FontWeight.Bold,
                                                     fontSize = 13.sp,
                                                     color = if (core.isEnabled) TextPrimary else TextSecondary
                                                 )
                                                 Text(
-                                                    text = if (core.isPerformanceCore) "Big A76" else "Little A55",
+                                                    text = if (core.isEnabled) "Включен" else "Отключен",
                                                     fontSize = 10.sp,
-                                                    color = if (core.isPerformanceCore) CoralPrimary else MintVoice
+                                                    color = if (core.isEnabled) CoralPrimary else TextSecondary
                                                 )
                                             }
                                             Checkbox(
@@ -193,7 +187,7 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                                                     viewModel.toggleCore(core.id, isChecked)
                                                 },
                                                 colors = CheckboxDefaults.colors(
-                                                    checkedColor = if (core.isPerformanceCore) CoralPrimary else MintVoice,
+                                                    checkedColor = CoralPrimary,
                                                     uncheckedColor = TextSecondary
                                                 )
                                             )
@@ -207,7 +201,7 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                     Spacer(modifier = Modifier.height(8.dp))
                     val activeCount = cores.count { it.isEnabled }
                     Text(
-                        text = "Активно ядер для ONNX: $activeCount из ${cores.size}",
+                        text = "Выбрано слотов: $activeCount (фактических потоков: ${viewModel.currentEngineThreads})",
                         fontSize = 12.sp,
                         color = CoralPrimary,
                         fontWeight = FontWeight.Medium
@@ -240,105 +234,87 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                     Spacer(modifier = Modifier.height(14.dp))
 
                     if (isCalibrating) {
-                        LinearProgressIndicator(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(6.dp)
-                                .clip(RoundedCornerShape(3.dp)),
-                            color = MintVoice,
-                            trackColor = ObsidianElevated
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(calibProgress, color = TextSecondary, fontSize = 12.sp)
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                text = calibProgress.ifEmpty { "Выполняется измерение..." },
+                                color = MintVoice,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(6.dp)
+                                    .clip(RoundedCornerShape(3.dp)),
+                                color = MintVoice,
+                                trackColor = ObsidianElevated
+                            )
+                        }
                     } else {
                         Button(
                             onClick = { viewModel.runCpuCalibration() },
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .testTag("calibrate_button"),
+                                .testTag("run_calibration_button"),
                             colors = ButtonDefaults.buttonColors(containerColor = MintVoice),
-                            shape = RoundedCornerShape(12.dp)
+                            shape = RoundedCornerShape(10.dp)
                         ) {
                             Icon(Icons.Default.PlayArrow, contentDescription = null, tint = ObsidianBackground)
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Запустить калибровку CPU", color = ObsidianBackground, fontWeight = FontWeight.Bold)
+                            Text("Запустить калибровку (тест RTF)", color = ObsidianBackground, fontWeight = FontWeight.Bold)
                         }
                     }
 
-                    // Calibration report table
                     report?.let { rep ->
                         Spacer(modifier = Modifier.height(14.dp))
-                        Divider(color = ObsidianElevated)
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Text(
-                            text = "Результаты калибровки (рекомендуется: ${rep.recommendedThreads} потока, RTF ${String.format("%.2f", rep.bestRtf)}):",
-                            fontWeight = FontWeight.SemiBold,
-                            color = CoralPrimary,
-                            fontSize = 13.sp
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        rep.steps.forEach { step ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 4.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text("${step.threadCount} потока(ов)", color = TextPrimary, fontSize = 12.sp)
-                                Text("RTF: ${String.format("%.2f", step.rtf)}", color = MintVoice, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                                Text("${step.synthesisTimeMs} мс", color = TextSecondary, fontSize = 12.sp)
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp)),
+                            color = ObsidianElevated
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Text(
+                                    text = "Результаты калибровки",
+                                    fontWeight = FontWeight.Bold,
+                                    color = MintVoice,
+                                    fontSize = 13.sp
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                rep.steps.forEach { res ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 3.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            "${res.threadCount} потока(ов):",
+                                            color = TextSecondary,
+                                            fontSize = 12.sp
+                                        )
+                                        Text(
+                                            "RTF: ${String.format("%.2f", res.rtf)} · ${res.synthesisTimeMs}мс",
+                                            color = if (res.threadCount == rep.recommendedThreads) MintVoice else TextPrimary,
+                                            fontWeight = if (res.threadCount == rep.recommendedThreads) FontWeight.Bold else FontWeight.Normal,
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = "Рекомендация: ${rep.recommendedThreads} потока(ов) (лучший RTF ${String.format("%.2f", rep.bestRtf)})",
+                                    fontSize = 12.sp,
+                                    color = CoralPrimary,
+                                    fontWeight = FontWeight.SemiBold
+                                )
                             }
                         }
                     }
                 }
             }
 
-            // 3. Floating Overlay Settings Card
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianCard)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Плавающая панель", fontWeight = FontWeight.Bold, color = TextPrimary, fontSize = 15.sp)
-                            Text(
-                                "Отображает компактную панель поверх других приложений при выделении текста",
-                                color = TextSecondary,
-                                fontSize = 12.sp,
-                                lineHeight = 16.sp
-                            )
-                        }
-                        Switch(
-                            checked = overlayEnabled,
-                            onCheckedChange = { checked ->
-                                if (checked && !Settings.canDrawOverlays(context)) {
-                                    val intent = Intent(
-                                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                        Uri.parse("package:${context.packageName}")
-                                    )
-                                    context.startActivity(intent)
-                                }
-                                viewModel.overlayEnabled.value = checked
-                            },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = CoralPrimary,
-                                checkedTrackColor = CoralPrimary.copy(alpha = 0.3f),
-                                uncheckedThumbColor = TextSecondary,
-                                uncheckedTrackColor = ObsidianElevated
-                            )
-                        )
-                    }
-                }
-            }
-
-            // 4. Cache Management Card
+            // 4. Floating Overlay Permission & Toggle Card
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -349,28 +325,58 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(Icons.Default.Storage, contentDescription = null, tint = AmberWave)
-                        Text("Кэш синтезированного аудио", fontWeight = FontWeight.Bold, color = TextPrimary, fontSize = 15.sp)
+                        Icon(Icons.Default.PictureInPicture, contentDescription = null, tint = CoralPrimary)
+                        Text("Плавающая панель поверх всех окон", fontWeight = FontWeight.Bold, color = TextPrimary, fontSize = 15.sp)
                     }
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        "Позволяет мгновенно возобновлять повторное чтение уже озвученных предложений без повторного использования CPU.",
+                        "Позволяет управлять синтезом, переключать предложения и следить за текстом поверх браузера или читалки.",
                         color = TextSecondary,
-                        fontSize = 12.sp
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp
                     )
+
                     Spacer(modifier = Modifier.height(12.dp))
-                    OutlinedButton(
-                        onClick = {
-                            viewModel.clearCache()
-                            cacheSizeBytes = 0L
-                        },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Default.DeleteSweep, contentDescription = null, tint = TextSecondary)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Очистить кэш PCM")
+
+                    val canDraw = Settings.canDrawOverlays(context)
+
+                    if (!canDraw) {
+                        OutlinedButton(
+                            onClick = {
+                                val intent = Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                                context.startActivity(intent)
+                            },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = CoralPrimary),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.Security, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Выдать разрешение поверх окон")
+                        }
+                    } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "Показывать мини-панель при старте",
+                                color = TextPrimary,
+                                fontSize = 13.sp
+                            )
+                            Switch(
+                                checked = overlayEnabled,
+                                onCheckedChange = { viewModel.setOverlayEnabled(it) },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = CoralPrimary,
+                                    checkedTrackColor = CoralPrimary.copy(alpha = 0.3f)
+                                )
+                            )
+                        }
                     }
                 }
             }
@@ -385,10 +391,9 @@ fun DiagnosticScreen(viewModel: MainViewModel) {
                     Text("Supertonic 3 Architecture", fontWeight = FontWeight.Bold, color = TextPrimary, fontSize = 14.sp)
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        "• Версия весов: HuggingFace snapshot aafc6e32416a594460b32413efc49d7fe4ce6d46\n" +
-                                "• Архитектура: G2P-free Flow Matching + ConvNeXt + Vocoder\n" +
+                        "• Архитектура: G2P-free Flow Matching + ConvNeXt + Vocoder\n" +
                                 "• Runtime: ONNX Runtime Android (JNI C++ CPU backend)\n" +
-                                "• Локальность: 100% офлайн, нулевая телеметрия, текст не передается в сеть.",
+                                "• Локальность: 100% офлайн, нулевая телеметрия, аудио в памяти (RAM), текст не передается в сеть.",
                         color = TextSecondary,
                         fontSize = 12.sp,
                         lineHeight = 18.sp
@@ -410,10 +415,4 @@ fun DiagnosticRow(title: String, value: String) {
         Text(title, color = TextSecondary, fontSize = 12.sp)
         Text(value, color = TextPrimary, fontWeight = FontWeight.Medium, fontSize = 12.sp)
     }
-}
-
-private fun calculatePcmCacheSize(context: android.content.Context): Long {
-    val dir = java.io.File(context.cacheDir, "pcm_cache")
-    val files: Array<java.io.File>? = dir.listFiles()
-    return files?.sumOf { it.length() } ?: 0L
 }

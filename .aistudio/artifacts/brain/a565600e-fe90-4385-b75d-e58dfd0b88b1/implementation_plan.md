@@ -1,121 +1,67 @@
-# Supertonic Reader — Advanced Audio Pipeline & Document Suite
+# План оптимизации производительности инференса Supertonic 3 и устранения задержек буферизации
 
-Comprehensive architectural upgrade for Supertonic Reader addressing speech truncation at accelerated speeds, introducing an interactive seekable timeline with non-linear forward/backward priority synthesis, decoupled background audio file generation, external player routing (VLC/system), multi-format document import (TXT, PDF, EPUB), and CPU core affinity management (Cores 0–7).
+## Анализ проблемы и первопричины задержки ("Буфер 0,0с | RTF 1,00")
 
-## User Review & Critical Decisions
-
-> [!IMPORTANT]
-> Key architectural decisions confirmed during the clarification turn:
-
-- **Confirmed Decision 1 (Zero-Loss Speed Control)**: Speed adjustment is completely decoupled from neural synthesis. The model always synthesizes at natural 1.0x rate without truncating vocoder samples, and speed (0.8x – 2.0x) is modulated non-destructively in `AudioTrack` via `PlaybackParams` / time-stretching.
-- **Confirmed Decision 2 (Interactive Timeline & Non-Linear Seek)**: A bidirectional interactive timeline scrubber where backward scrub plays cached/spooled audio instantly, and forward scrub dynamically jumps the synthesis queue to the targeted chunk, continuing sequential synthesis from the new cursor. Direct sentence step buttons (`-1` / `+1`) and "Open in external player (VLC)" are provided.
-- **Confirmed Decision 3 (Document Import)**: Built-in zero-dependency extractors for TXT, PDF (page-by-page extraction), and EPUB (ZIP + XHTML chapter parser) via Android Storage Access Framework.
-- **Confirmed Decision 4 (Decoupled Background Synthesis & Playback)**: Batch audio file generation runs at uncapped CPU speed without requiring real-time playback pacing, and playing existing audio files never interrupts active text synthesis.
-- **Confirmed Decision 5 (CPU Core Affinity Selection)**: An interactive core selector (Cores 0–7) allowing users to assign synthesis threads to specific cores (e.g. Big Cores 6–7 vs Little Cores 0–5 on Helio G99), similar to Winlator.
-
----
-
-## 1. Overview & Core Concept
-
-- **Problem Addressed**:
-  1. Accelerated speech (1.3x) truncated vocoder samples due to artificial duration slicing, causing swallowed words and missing short phrases.
-  2. Inability to seek through text during synthesis or jump ahead to un-synthesized sections.
-  3. Real-time inference was entangled with playback and file export, causing mutual cancellations.
-  4. Lack of direct book/document reading (PDF, EPUB, TXT).
-  5. Inability to target specific CPU cluster cores on big.LITTLE architectures.
-- **Deliverables**:
-  - Full-fidelity vocoder sample preservation with zero truncation.
-  - Interactive scrubbing timeline with chunk status indicators (Cached / Synthesizing / Queued).
-  - Independent batch file generator + external player stream/export (`VLC`, etc.).
-  - Document parser supporting `.txt`, `.pdf`, `.epub`.
-  - CPU Core Mask affinity controller (Cores 0–7).
+1. **Раздувание временной сетки латентов (`latentLen`) в `SupertonicEngine.kt`**:
+   - В предыдущей попытке предотвратить проглатывание коротких окончаний была добавлена формула:
+     `val minDurationFromText = (codePoints.size * 0.09f + 0.35f).coerceAtLeast(1.2f)`
+     `val duration = max(rawDuration * 1.10f, minDurationFromText)`
+   - Для обычного предложения из 150 символов эта формула принудительно устанавливала длительность более 14–15 секунд (вместо естественных 3–4 секунд), из-за чего число латентных фреймов `latentLen` подскакивало с 30 до более чем 220.
+   - Поскольку Self-Attention в трансформере `vector_estimator.onnx` имеет квадратичную сложность $O(L^2)$, объём матричных вычислений на каждом шаге денойзинга вырос в **30–50 раз**. Мобильный CPU тратил более минуты на расчет одного предложения.
+2. **Парсинг тензора длительности (`duration_predictor.onnx`)**:
+   - Выходной тензор `dp` в зависимости от формата ONNX Runtime может возвращаться как многомерный массив (`Array<FloatArray>` или `Array<Array<FloatArray>>`). Жёсткий каст `dpVal[0] as? FloatArray` в ряде случаев давал `null` и откатывался к дефолту.
+   - Необходимо внедрить рекурсивный безопасный экстрактор скаляра `extractFirstFloat(dpVal)` и естественный мягкий запас времени (+0.15–0.25с) без искусственного раздувания таймлайна.
+3. **Конфигурация потоков CPU и маска ядер по умолчанию**:
+   - Пользователь запросил использовать по умолчанию последние 2 ядра BIG (ядра 6 и 7 Cortex-A76).
+   - В `CpuAffinityManager.kt` дефолтная маска включала все ядра (`allCoresMask`), что приводило к миграции потоков на медленные энергоэффективные ядра A55.
+   - В `SupertonicPlaybackService.kt` движок проверял только `if (!engine.isLoaded)` и не обновлял сессию ONNX с новым количеством потоков при смене маски ядер.
+4. **Отсутствие обратной связи при ошибке в UI**:
+   - Если модель ещё не была скачана или произошёл сбой сессии, UI оставался в состоянии `BUFFERING` без отображения текста ошибки.
 
 ---
 
-## 2. User Experience & Visual Design
+## Предлагаемые изменения
 
-### Key User Flows
+### 1. `app/src/main/java/com/example/supertonic/engine/SupertonicEngine.kt`
+- **Оптимизация расчета длительности и размера латентов**:
+  - Реализовать надежный экстрактор первого float значения `extractFirstFloat(dpVal)`.
+  - Убрать формулу искусственного завышения длительности `minDurationFromText` (0.09s/символ). Вместо этого использовать точное предсказание модели с естественным запасом на затухание (+5% и +0.20 секунды) для гарантированного сохранения конечных фонем.
+  - Ограничить `latentLen` реальной предсказанной фразой, сократив число операций в `vector_estimator` в десятки раз.
+- **Очистка ресурсов и тензоров**:
+  - Добавить немедленный вызов `.close()` на промежуточных `OnnxTensor` внутри цикла шагов для минимизации нагрузки на сборщик мусора Android.
 
-1. **Document Import Flow**:
-   - In Reader tab, tap "Импорт книги / документа" (`.txt`, `.pdf`, `.epub`).
-   - App parses text/chapters with progress, displays chapter titles or total word count, and loads cleanly into the reader editor.
-2. **Interactive Timeline & Non-Linear Scrubbing**:
-   - Scrubber slider along the bottom of the reader displaying current sentence timecode and total progress.
-   - User drags slider backward: Audio immediately seeks and plays from the already synthesized buffer/cache.
-   - User drags slider forward: Audio player waits briefly in buffering state while synthesis worker aborts the old tail and starts immediately at the chosen chunk index.
-   - Quick jump buttons: `[ -15 сек ]`, `[ Предыдущая фраза ]`, `[ Следующая фраза ]`, `[ +15 сек ]`.
-3. **Decoupled Background Export & External Player**:
-   - "Создать аудиофайл в фоне": runs fast-as-possible batch synthesis without audio track pacing.
-   - "Открыть в стороннем плеере": fires `ACTION_VIEW` intent with `audio/*` and `FLAG_GRANT_READ_URI_PERMISSION` for playback in VLC, Poweramp, or system media player.
-4. **CPU Core Affinity Settings**:
-   - Visual 8-core diagram in Settings (Cores 0 to 7) with Cortex-A76 (Big) and Cortex-A55 (Little) tags.
-   - Presets: "Все ядра (0-7)", "Производительные (6-7)", "Энергосберегающие (0-5)", "Пользовательские".
+### 2. `app/src/main/java/com/example/supertonic/engine/CpuAffinityManager.kt`
+- **Настройка ядер по умолчанию на Cortex-A76**:
+  - Изменить `getDefaultCoreMask()`: для 8-ядерных процессоров по умолчанию включаются ядро 6 и ядро 7 (`(1 shl 6) or (1 shl 7)`).
+  - Сохранять возможность для пользователя гибко переключать любые ядра через существующий UI настроек.
+  - Возвращать реальное число активных BIG-потоков для ONNX Runtime (`numThreads = 2`).
+
+### 3. `app/src/main/java/com/example/supertonic/playback/SupertonicPlaybackService.kt`
+- **Динамическое применение потоков и ускоренный старт**:
+  - При запуске озвучки проверять, совпадает ли число потоков в загруженном `engine.currentThreads` с выбранной маской `cpuAffinity.getActiveThreadCount()`. Если нет — быстро перезагружать сессии с оптимальным числом потоков.
+  - Запуск воспроизведения: первый чанк синтезируется незамедлительно (с установленным числом шагов 2–3, обеспечивающим RTF ~0.4–0.6 на A76), аудио поступает в `AudioTrack` за <0.8 секунды, а фоновый воркер без пауз подготавливает следующие предложения наперед.
+  - Вывод информативного статуса ошибки в `_playbackState` при отсутствии файлов модели или нехватке памяти.
+
+### 4. `app/src/main/java/com/example/supertonic/ui/MainViewModel.kt`
+- Установить значение по умолчанию `synthesisSteps = 2` (режим реального времени с мгновенным стартом; пользователь может повысить до 3 или 5 в селекторе на экране).
+- Синхронизировать смену ядер в UI с мгновенным обновлением конфигурации фонового сервиса.
+
+### 5. `app/src/main/java/com/example/supertonic/ui/screens/ReaderScreen.kt`
+- Добавить баннер предупреждения/ошибки, если модель не загружена или произошёл сбой, с кнопкой прямого перехода к загрузке весов.
+- Отображение активного режима ядер (Cortex-A76) прямо в панели таймлайна/инфо для наглядного контроля.
 
 ---
 
-## 3. Technical Architecture & Component Mapping
+## План верификации (Verification Plan)
 
-### System Diagram
+### Компиляция и сборка
+1. Запуск `compile_applet` для проверки отсутствия синтаксических ошибок, типов тензоров ONNX и согласованности интерфейсов.
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        SUPERTONIC READER SUITE                         │
-│                                                                        │
-│   ┌────────────────────┐   ┌────────────────────┐   ┌────────────────┐ │
-│   │  Document Parser   │   │ Interactive Player │   │ CPU Affinity   │ │
-│   │ (TXT, PDF, EPUB)   │   │ Timeline & Scrubber│   │ Cores (0..7)   │ │
-│   └─────────┬──────────┘   └─────────┬──────────┘   └───────┬────────┘ │
-│             │                        │                      │          │
-│             ▼                        ▼                      │          │
-│     Normalized Text          PlaybackSessionManager         │          │
-│                                  │           │              │          │
-│                 ┌────────────────┘           └────────┐     ▼          │
-│                 ▼                                     ▼   sched_set    │
-│      SynthesisWorker (Prioritized)             AudioTrackPlayer        │
-│          ▲               │                   (Time-stretch 0.8-2.0x)   │
-│          │               ▼                            ▲                │
-│    SupertonicEngine  Bounded Channel<PcmChunk>        │                │
-│   (Pristine 1.0x)    & Spool Cache ───────────────────┘                │
-│                                                                        │
-│   ┌───────────────────────────┐         ┌──────────────────────────┐   │
-│   │ Independent Batch Creator │         │ External Player Launcher │   │
-│   │ (Direct M4A / WAV to Disk)│         │ (VLC / System via SAF)   │   │
-│   └───────────────────────────┘         └──────────────────────────┘   │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-### Detailed Component Implementation Plan
-
-1. **Fixing Audio Slicing (`SupertonicEngine.kt`)**:
-   - Remove `targetSampleCount = min(rawSamples.size, (duration * sampleRate).toInt())` truncation when `speed > 1.0`.
-   - Take the full `rawSamples` output from `vocoder.onnx` to preserve final consonant decays, trailing punctuation pauses, and full phrase endings.
-   - Apply a small 50ms smooth linear fade-out on the very last samples to prevent pop artifacts while ensuring 100% of the speech signal is intact.
-   - Pass synthesized audio to `AudioTrackPlayer` which handles playback rate via `PlaybackParams.setSpeed(speed)` with zero sample loss.
-
-2. **Interactive Timeline & Non-Linear Queue (`SupertonicPlaybackService.kt`)**:
-   - Maintain a list of chunk synthesis statuses: `enum class ChunkStatus { PENDING, SYNTHESIZING, READY, PLAYING }`.
-   - Maintain a ring cache of synthesized PCM chunks indexed by chunk index.
-   - Add `seekToChunk(targetIndex: Int)`:
-     - If chunk is `READY`, immediately flush AudioTrack and feed from `targetIndex`.
-     - If chunk is `PENDING`, cancel current synthesis job and restart synthesis queue starting at `targetIndex`.
-   - Expose current playback position (seconds & chunk index) and estimated total duration.
-
-3. **Multi-Format Document Parser (`DocumentParser.kt`)**:
-   - **TXT**: Read via buffered UTF-8 reader with automatic UTF-16/Windows-1251 fallback.
-   - **PDF**: Uses Android standard `android.graphics.pdf.PdfRenderer` and lightweight text stream scanner, extracting text page-by-page.
-   - **EPUB**: Uses standard `java.util.zip.ZipInputStream` to parse `META-INF/container.xml`, locate `.opf`, extract the spine order, read XHTML chapters, and strip tags cleanly to text.
-
-4. **Independent Batch Audio Generator (`BatchExporter.kt`)**:
-   - Runs in a dedicated background coroutine without holding audio focus or playing sound.
-   - Synthesizes all chunks sequentially at maximum CPU throughput.
-   - Streams directly into `MediaCodecExporter.encodePcmToM4a` or `convertPcmToWav`.
-   - Emits independent progress (`exportProgress`) and writes to library.
-
-5. **External Player Launch (`ExternalPlayerLauncher.kt`)**:
-   - Exports the current session spool to a temporary `.m4a` / `.wav` file.
-   - Generates a secure `FileProvider` URI and launches `Intent(Intent.ACTION_VIEW)` with MIME `audio/*`.
-   - Shows app chooser or directs straight to VLC if installed.
-
-6. **CPU Core Affinity Mask (`CpuAffinityManager.kt`)**:
-   - Queries `/sys/devices/system/cpu/present` and `/sys/devices/system/cpu/cpu*/topology/` or `Runtime.getRuntime().availableProcessors()`.
-   - Allows user to set affinity mask bitfield (e.g. `0b11000000` for cores 6-7, or `0b11111111` for all cores) and applies it to ONNX Runtime worker threads and execution options.
+### Тестирование производительности и функциональности
+1. Проверка синтеза первого предложения вступительного текста:
+   - Предложение "Привет!": длительность ~1.0–1.2с, генерация на 2 потоках A76 занимает ~0.4–0.5с (RTF < 0.6).
+   - Буфер мгновенно наполняется, воспроизведение стартует без минутного зависания.
+2. Проверка связки ядер:
+   - Проверка маски по умолчанию: ядра 6 и 7 активны (`mask = 0b11000000`).
+   - Переключение ядер в настройках корректно перестраивает число потоков инференса.
+3. Проверка звука на отсутствие проглатывания окончаний при высокой скорости плеера (1.3x, 1.5x) благодаря аппаратному тайм-стретчингу `AudioTrack.setPlaybackParams`.

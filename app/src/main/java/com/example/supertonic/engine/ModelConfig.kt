@@ -149,17 +149,17 @@ object SupertonicConstants {
         ModelFileDescriptor(
             relativePath = "text_encoder.onnx",
             remoteUrl = "$HF_REPO_BASE/onnx/text_encoder.onnx",
-            expectedSizeBytes = 36000000L
+            expectedSizeBytes = 71600000L
         ),
         ModelFileDescriptor(
             relativePath = "vector_estimator.onnx",
             remoteUrl = "$HF_REPO_BASE/onnx/vector_estimator.onnx",
-            expectedSizeBytes = 125000000L
+            expectedSizeBytes = 211000000L
         ),
         ModelFileDescriptor(
             relativePath = "vocoder.onnx",
             remoteUrl = "$HF_REPO_BASE/onnx/vocoder.onnx",
-            expectedSizeBytes = 82000000L
+            expectedSizeBytes = 113000000L
         ),
         ModelFileDescriptor(
             relativePath = "voice_styles/F1.json",

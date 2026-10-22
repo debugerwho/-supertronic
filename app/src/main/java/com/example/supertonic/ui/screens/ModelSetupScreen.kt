@@ -31,7 +31,12 @@ import com.example.ui.theme.*
 @Composable
 fun ModelSetupScreen(viewModel: MainViewModel) {
     val downloadState by viewModel.downloadState.collectAsState()
+    val totalContentLengthBytes by viewModel.modelManager.totalContentLengthBytes.collectAsState()
     val verificationList = viewModel.modelManager.getFilesVerificationList()
+
+    val sizeText = totalContentLengthBytes?.let { bytes ->
+        "~${(bytes + 500000L) / (1024 * 1024)} МБ"
+    } ?: "неизвестно"
 
     Scaffold(
         containerColor = ObsidianBackground
@@ -71,7 +76,7 @@ fun ModelSetupScreen(viewModel: MainViewModel) {
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
-                    text = "Для 100% автономного синтеза без интернета требуются веса модели Supertone Supertonic 3 (~235 МБ).",
+                    text = "Для 100% автономного синтеза без интернета требуются веса модели Supertone Supertonic 3 ($sizeText).",
                     style = MaterialTheme.typography.bodyMedium,
                     color = TextSecondary,
                     lineHeight = 20.sp
@@ -179,7 +184,7 @@ fun ModelSetupScreen(viewModel: MainViewModel) {
                                 ) {
                                     Icon(Icons.Default.CloudDownload, contentDescription = "Загрузить")
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Загрузить модель (~235 МБ)", fontWeight = FontWeight.Bold)
+                                    Text("Загрузить модель ($sizeText)", fontWeight = FontWeight.Bold)
                                 }
                             }
                         }

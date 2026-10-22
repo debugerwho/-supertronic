@@ -2,16 +2,20 @@ package com.example.supertonic.engine
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 sealed class ModelDownloadState {
@@ -39,8 +43,22 @@ class ModelManager(private val context: Context) {
     private val tag = "ModelManager"
     val modelDir: File = File(context.filesDir, "supertonic_model")
 
+    companion object {
+        private val cachedContentLengths = ConcurrentHashMap<String, Long>()
+        @Volatile private var lastHeadFetchTimestamp = 0L
+        private const val HEAD_TTL_MS = 7L * 24 * 60 * 60 * 1000L // 7 days
+        private const val PREFS_NAME = "supertonic_model_sizes"
+        private const val KEY_LAST_FETCH = "last_head_fetch_ts"
+    }
+
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
     private val _downloadState = MutableStateFlow<ModelDownloadState>(ModelDownloadState.NotInstalled)
     val downloadState: StateFlow<ModelDownloadState> = _downloadState.asStateFlow()
+
+    private val headContentLengths = ConcurrentHashMap<String, Long>()
+    private val _totalContentLengthBytes = MutableStateFlow<Long?>(null)
+    val totalContentLengthBytes: StateFlow<Long?> = _totalContentLengthBytes.asStateFlow()
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -50,11 +68,106 @@ class ModelManager(private val context: Context) {
     @Volatile
     private var isCancelled = false
 
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     init {
+        // 1. Load cached sizes from SharedPreferences
+        loadCachedSizes()
+
+        // 2. Perform offline verification first without blocking on network
         checkInstalledState()
+
+        // 3. Launch background HEAD update only if TTL expired or never fetched
+        val now = System.currentTimeMillis()
+        val lastFetch = prefs.getLong(KEY_LAST_FETCH, 0L)
+        lastHeadFetchTimestamp = lastFetch
+        if (now - lastFetch > HEAD_TTL_MS || cachedContentLengths.isEmpty()) {
+            scope.launch {
+                fetchHeadSizes()
+            }
+        }
+    }
+
+    private fun loadCachedSizes() {
+        for (desc in SupertonicConstants.MODEL_FILES) {
+            val key = "size_rev1:${desc.relativePath}"
+            val saved = prefs.getLong(key, -1L)
+            if (saved > 0) {
+                cachedContentLengths[desc.relativePath] = saved
+                headContentLengths[desc.relativePath] = saved
+            }
+        }
+        val sum = SupertonicConstants.MODEL_FILES.sumOf {
+            headContentLengths[it.relativePath] ?: it.expectedSizeBytes
+        }
+        _totalContentLengthBytes.value = sum
+    }
+
+    private fun saveCachedSize(relativePath: String, size: Long) {
+        cachedContentLengths[relativePath] = size
+        headContentLengths[relativePath] = size
+        prefs.edit().putLong("size_rev1:$relativePath", size).apply()
     }
 
     fun getVoiceStylesDir(): File = File(modelDir, "voice_styles")
+
+    fun getInstalledVoiceIds(): List<String> {
+        val stylesDir = File(modelDir, "voice_styles")
+        if (!stylesDir.exists()) return emptyList()
+        return stylesDir.listFiles { _, name -> name.endsWith(".json") }
+            ?.map { it.nameWithoutExtension }
+            ?.sorted() ?: emptyList()
+    }
+
+    suspend fun fetchHeadSizes(): Long = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        if (now - lastHeadFetchTimestamp < 60_000L && cachedContentLengths.size == SupertonicConstants.MODEL_FILES.size) {
+            // Already fetched recently in this process
+            return@withContext cachedContentLengths.values.sum()
+        }
+
+        var sum = 0L
+        var successCount = 0
+        for (desc in SupertonicConstants.MODEL_FILES) {
+            try {
+                val headReq = Request.Builder().url(desc.remoteUrl).head().build()
+                client.newCall(headReq).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val cl = response.header("Content-Length")?.toLongOrNull()
+                        if (cl != null && cl > 0) {
+                            saveCachedSize(desc.relativePath, cl)
+                            sum += cl
+                            successCount++
+                        } else {
+                            val existing = cachedContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
+                            headContentLengths[desc.relativePath] = existing
+                            sum += existing
+                        }
+                    } else {
+                        val existing = cachedContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
+                        headContentLengths[desc.relativePath] = existing
+                        sum += existing
+                    }
+                }
+            } catch (e: Exception) {
+                val existing = cachedContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
+                headContentLengths[desc.relativePath] = existing
+                sum += existing
+            }
+        }
+        if (successCount > 0) {
+            lastHeadFetchTimestamp = now
+            prefs.edit().putLong(KEY_LAST_FETCH, now).apply()
+            _totalContentLengthBytes.value = sum
+        } else {
+            val manifestSum = SupertonicConstants.MODEL_FILES.sumOf {
+                cachedContentLengths[it.relativePath] ?: it.expectedSizeBytes
+            }
+            _totalContentLengthBytes.value = manifestSum
+            sum = manifestSum
+        }
+        sum
+    }
 
     fun checkInstalledState(): Boolean {
         if (!modelDir.exists()) {
@@ -62,35 +175,55 @@ class ModelManager(private val context: Context) {
             return false
         }
 
-        var allPresent = true
         var totalSize = 0L
 
         for (desc in SupertonicConstants.MODEL_FILES) {
             val file = File(modelDir, desc.relativePath)
-            if (!file.exists() || file.length() < 100) {
-                allPresent = false
-                break
+            if (!file.exists()) {
+                _downloadState.value = ModelDownloadState.NotInstalled
+                return false
             }
-            totalSize += file.length()
+
+            val actualLength = file.length()
+            val cachedExpected = headContentLengths[desc.relativePath] ?: cachedContentLengths[desc.relativePath]
+
+            val isValid = if (cachedExpected != null && cachedExpected > 0) {
+                actualLength == cachedExpected
+            } else {
+                // If exact HEAD size is not yet cached, tolerate minor manifest deviations <= 2%
+                val diff = Math.abs(actualLength - desc.expectedSizeBytes)
+                val tolerance = (desc.expectedSizeBytes * 0.02).toLong()
+                diff <= tolerance
+            }
+
+            // Obvious corruption: <90% or >110% of manifest
+            val isCorrupted = actualLength < (desc.expectedSizeBytes * 0.90) || actualLength > (desc.expectedSizeBytes * 1.10)
+
+            if (!isValid || isCorrupted) {
+                _downloadState.value = ModelDownloadState.Error("Файл ${desc.relativePath} поврежден, скачать заново")
+                return false
+            }
+            totalSize += actualLength
         }
 
-        if (allPresent) {
-            _downloadState.value = ModelDownloadState.Ready(modelDir, totalSize)
-            return true
-        } else {
-            _downloadState.value = ModelDownloadState.NotInstalled
-            return false
-        }
+        _downloadState.value = ModelDownloadState.Ready(modelDir, totalSize)
+        return true
     }
 
     fun getFilesVerificationList(): List<FileVerificationItem> {
         return SupertonicConstants.MODEL_FILES.map { desc ->
             val file = File(modelDir, desc.relativePath)
+            val expected = headContentLengths[desc.relativePath] ?: cachedContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
+            val presentAndValid = if (file.exists()) {
+                val diff = Math.abs(file.length() - expected)
+                diff == 0L || (diff <= (expected * 0.02).toLong() && file.length() > expected * 0.90 && file.length() < expected * 1.10)
+            } else false
+
             FileVerificationItem(
                 fileName = desc.relativePath,
-                isPresent = file.exists() && file.length() > 0,
+                isPresent = presentAndValid,
                 sizeBytes = if (file.exists()) file.length() else 0L,
-                expectedSizeBytes = desc.expectedSizeBytes
+                expectedSizeBytes = expected
             )
         }
     }
@@ -106,14 +239,16 @@ class ModelManager(private val context: Context) {
         }
         File(modelDir, "voice_styles").mkdirs()
 
-        val totalExpectedBytes = SupertonicConstants.MODEL_FILES.sumOf { it.expectedSizeBytes }
+        // Fetch HEAD sizes before starting download
+        val totalExpectedBytes = fetchHeadSizes()
         var totalBytesDownloaded = 0L
 
-        // Count already downloaded bytes for resume
+        // Count already downloaded complete files
         for (desc in SupertonicConstants.MODEL_FILES) {
-            val file = File(modelDir, desc.relativePath)
-            if (file.exists()) {
-                totalBytesDownloaded += file.length()
+            val targetFile = File(modelDir, desc.relativePath)
+            val expectedSize = headContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
+            if (targetFile.exists() && targetFile.length() == expectedSize) {
+                totalBytesDownloaded += targetFile.length()
             }
         }
 
@@ -128,8 +263,9 @@ class ModelManager(private val context: Context) {
             }
 
             val targetFile = File(modelDir, desc.relativePath)
-            if (targetFile.exists() && targetFile.length() > 0) {
-                // File already downloaded
+            val expectedSize = headContentLengths[desc.relativePath] ?: desc.expectedSizeBytes
+
+            if (targetFile.exists() && targetFile.length() == expectedSize) {
                 continue
             }
 
@@ -147,17 +283,73 @@ class ModelManager(private val context: Context) {
                 val call = client.newCall(requestBuilder.build())
                 val response = call.execute()
 
-                if (!response.isSuccessful && response.code != 416) {
-                    // If range not satisfiable (416) or fail, try fresh download
-                    existingPartSize = 0L
+                if (response.code == 416) {
+                    // HTTP 416 Range Not Satisfiable: delete .part file and redownload from scratch
+                    response.close()
                     partFile.delete()
+                    existingPartSize = 0L
+
                     val retryCall = client.newCall(Request.Builder().url(desc.remoteUrl).build())
                     val retryResp = retryCall.execute()
                     if (!retryResp.isSuccessful) {
                         _downloadState.value = ModelDownloadState.Error("Ошибка загрузки ${desc.relativePath}: HTTP ${retryResp.code}")
                         return@withContext false
                     }
-                    saveStreamWithProgress(retryResp.body?.byteStream(), partFile, false, desc) { bytesJustRead ->
+
+                    saveStreamWithProgress(retryResp.body?.byteStream(), partFile, append = false) { bytesJustRead ->
+                        totalBytesDownloaded += bytesJustRead
+                        val now = System.currentTimeMillis()
+                        if (now - lastUpdateTime >= 300) {
+                            val timeDeltaSec = (now - lastUpdateTime) / 1000.0
+                            if (timeDeltaSec > 0) {
+                                currentSpeed = ((totalBytesDownloaded - lastBytesCounter) / timeDeltaSec).toLong()
+                            }
+                            lastBytesCounter = totalBytesDownloaded
+                            lastUpdateTime = now
+                            val remainingBytes = (totalExpectedBytes - totalBytesDownloaded).coerceAtLeast(0)
+                            val eta = if (currentSpeed > 0) remainingBytes / currentSpeed else 0L
+                            val progress = (totalBytesDownloaded.toFloat() / totalExpectedBytes.toFloat()).coerceIn(0f, 1f)
+
+                            _downloadState.value = ModelDownloadState.Downloading(
+                                currentFileName = desc.relativePath,
+                                downloadedBytes = totalBytesDownloaded,
+                                totalBytes = totalExpectedBytes,
+                                progressPercentage = progress,
+                                speedBytesPerSec = currentSpeed,
+                                etaSeconds = eta
+                            )
+                        }
+                    }
+                } else if (response.code == 200) {
+                    // Response 200: Server sends full file from byte 0, do NOT append!
+                    existingPartSize = 0L
+                    saveStreamWithProgress(response.body?.byteStream(), partFile, append = false) { bytesJustRead ->
+                        totalBytesDownloaded += bytesJustRead
+                        val now = System.currentTimeMillis()
+                        if (now - lastUpdateTime >= 300) {
+                            val timeDeltaSec = (now - lastUpdateTime) / 1000.0
+                            if (timeDeltaSec > 0) {
+                                currentSpeed = ((totalBytesDownloaded - lastBytesCounter) / timeDeltaSec).toLong()
+                            }
+                            lastBytesCounter = totalBytesDownloaded
+                            lastUpdateTime = now
+                            val remainingBytes = (totalExpectedBytes - totalBytesDownloaded).coerceAtLeast(0)
+                            val eta = if (currentSpeed > 0) remainingBytes / currentSpeed else 0L
+                            val progress = (totalBytesDownloaded.toFloat() / totalExpectedBytes.toFloat()).coerceIn(0f, 1f)
+
+                            _downloadState.value = ModelDownloadState.Downloading(
+                                currentFileName = desc.relativePath,
+                                downloadedBytes = totalBytesDownloaded,
+                                totalBytes = totalExpectedBytes,
+                                progressPercentage = progress,
+                                speedBytesPerSec = currentSpeed,
+                                etaSeconds = eta
+                            )
+                        }
+                    }
+                } else if (response.code == 206) {
+                    // Response 206: Partial Content, append to existing part file
+                    saveStreamWithProgress(response.body?.byteStream(), partFile, append = true) { bytesJustRead ->
                         totalBytesDownloaded += bytesJustRead
                         val now = System.currentTimeMillis()
                         if (now - lastUpdateTime >= 300) {
@@ -182,31 +374,9 @@ class ModelManager(private val context: Context) {
                         }
                     }
                 } else {
-                    val append = existingPartSize > 0 && response.code == 206
-                    saveStreamWithProgress(response.body?.byteStream(), partFile, append, desc) { bytesJustRead ->
-                        totalBytesDownloaded += bytesJustRead
-                        val now = System.currentTimeMillis()
-                        if (now - lastUpdateTime >= 300) {
-                            val timeDeltaSec = (now - lastUpdateTime) / 1000.0
-                            if (timeDeltaSec > 0) {
-                                currentSpeed = ((totalBytesDownloaded - lastBytesCounter) / timeDeltaSec).toLong()
-                            }
-                            lastBytesCounter = totalBytesDownloaded
-                            lastUpdateTime = now
-                            val remainingBytes = (totalExpectedBytes - totalBytesDownloaded).coerceAtLeast(0)
-                            val eta = if (currentSpeed > 0) remainingBytes / currentSpeed else 0L
-                            val progress = (totalBytesDownloaded.toFloat() / totalExpectedBytes.toFloat()).coerceIn(0f, 1f)
-
-                            _downloadState.value = ModelDownloadState.Downloading(
-                                currentFileName = desc.relativePath,
-                                downloadedBytes = totalBytesDownloaded,
-                                totalBytes = totalExpectedBytes,
-                                progressPercentage = progress,
-                                speedBytesPerSec = currentSpeed,
-                                etaSeconds = eta
-                            )
-                        }
-                    }
+                    response.close()
+                    _downloadState.value = ModelDownloadState.Error("Ошибка загрузки ${desc.relativePath}: HTTP ${response.code}")
+                    return@withContext false
                 }
 
                 if (isCancelled) {
@@ -214,10 +384,19 @@ class ModelManager(private val context: Context) {
                     return@withContext false
                 }
 
-                // Rename part file to actual file
-                if (partFile.exists()) {
-                    partFile.renameTo(targetFile)
+                // Verify completed file length against expected Content-Length
+                if (partFile.length() != expectedSize && expectedSize > 0) {
+                    partFile.delete()
+                    _downloadState.value = ModelDownloadState.Error(
+                        "Файл ${desc.relativePath} поврежден (размер ${partFile.length()} вместо $expectedSize), скачать заново"
+                    )
+                    return@withContext false
                 }
+
+                // Atomic rename to final destination file
+                targetFile.delete()
+                partFile.renameTo(targetFile)
+                saveCachedSize(desc.relativePath, targetFile.length())
 
             } catch (e: Exception) {
                 Log.e(tag, "Failed downloading ${desc.relativePath}", e)
@@ -234,7 +413,6 @@ class ModelManager(private val context: Context) {
         stream: InputStream?,
         outFile: File,
         append: Boolean,
-        desc: ModelFileDescriptor,
         onBytesRead: (Int) -> Unit
     ) {
         if (stream == null) return
@@ -247,6 +425,7 @@ class ModelManager(private val context: Context) {
                     fos.write(buffer, 0, read)
                     onBytesRead(read)
                 }
+                fos.flush()
             }
         }
     }

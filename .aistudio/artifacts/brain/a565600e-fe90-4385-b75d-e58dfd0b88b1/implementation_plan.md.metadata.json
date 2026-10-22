@@ -1,6 +1,6 @@
 {
-  "summary": "Comprehensive architectural plan for Supertonic Reader upgrade: fixing audio truncation at accelerated speeds, interactive timeline scrubber with non-linear forward/backward seek, background batch export decoupled from playback, document import (TXT, PDF, EPUB), external player integration (VLC), and CPU core affinity selection (Cores 0-7).",
-  "updatedAt": "2026-10-18T12:42:32.058694502Z",
+  "summary": "План комплексной оптимизации движка Supertonic 3:\n1. Устранение раздувания сетки латентов (latentLen) и безопасное извлечение длительности из duration_predictor, что снижает время синтеза на порядок.\n2. Привязка по умолчанию к ядрам Cortex-A76 (ядра 6 и 7) с динамическим обновлением пула потоков ONNX Runtime при смене маски.\n3. Быстрый предбуфер первого чанка с 2 шагами инференса для мгновенного старта воспроизведения (< 0.8с) и плавного опережающего инференса (RTF < 0.7).\n4. Диагностика ошибок и индикация состояния модели в UI ридера, чтобы избежать 'вечной буферизации' в случае незагруженных весов.",
+  "updatedAt": "2026-10-18T17:54:04.135888969Z",
   "requestFeedback": true,
   "userFacing": true
 }
