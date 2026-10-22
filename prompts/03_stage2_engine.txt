@@ -1,0 +1,41 @@
+ЭТАП 2. КОНТРАКТ ДВИЖКА И КАЧЕСТВО СИНТЕЗА. Самый важный этап для «проглатывания» слов.
+
+ЦЕЛЬ: привести инференс к эталонному контракту Supertonic 3 и сделать его тестируемым.
+
+СДЕЛАЙ:
+1) Введи интерфейс SpeechEngine (engine/SpeechEngine.kt) и реализацию OnnxSpeechEngine:
+   - load(modelDir, threads): Result<Unit>; state: StateFlow<EngineState>;
+   - suspend synthesize(SynthesisRequest): SynthesisResult (pcm: ByteArray, sampleRate,
+     durationSec, synthMs, rtf);
+   - close().
+   EngineHost — единственный владелец экземпляра и сессий, с Mutex; никакие другие классы
+   не создают SupertonicEngine.
+2) Исправь контракт синтеза по эталону (github.com/supertone-inc/supertonic, py/helper.py):
+   - duration = duration_predictor_output / speed; параметр speed реально используется
+     (сейчас он мёртвый);
+   - удали minDurationFromText и умножение rawDuration * 1.10;
+   - НЕ обрезай выход вокодера; fade-in/out — не более 3 мс (или убери вовсе);
+   - latent_len и latent_mask считай как в эталоне (ceil(wav_len / (base_chunk_size *
+     chunk_compress_factor)), маска из wav_lengths), а не «все единицы»;
+   - total_step — параметр, значения в UI: 2, 5, 10, по умолчанию 5;
+   - шум латентов: ThreadLocalRandom.nextGaussian(); Random() не создавай на каждый чанк;
+   - проверь форму выхода vector_estimator: если она не Array<Array<FloatArray>> — верни
+     ошибку, а не продолжай с прежним (шумовым) латентом.
+3) Закрой все ресурсы: dpResult, textEncResult, vectorEstResult, vocoderResult,
+   все OnnxTensor в finally. Проверь отсутствие утечек в цикле шагов.
+4) Калибратор: не создавай второй экземпляр движка. Используй EngineHost: последовательные
+   load(threads)/synthesize/close, между шагами обязательно освобождай сессии.
+5) Логирование на каждый чанк: chars, dp_duration, real_duration, synth_ms, rtf, steps,
+   threads. В диагностике — таблица последних 20 чанков.
+6) Сегментация (core/TextSegmenter.kt): перепиши на один проход с точными charRange, без
+   indexOf на каждый чанк; склейка чанков < 25 символов; первый чанк сессии ≤ 80 символов;
+   лимит 250; длинные предложения — по , ; :, затем по словам. Язык в чанк подставляет
+   LanguagePolicy (этап 8), на этом этапе — переданный lang.
+
+ПРИЁМКА:
+- два контрольных WAV на одинаковом русском тексте: steps=3 и steps=8, плюс короткая фраза
+  с «ё/й» и фраза из одного слова — они приложены/сохранены в приложении;
+- в отчёте: до/после, что изменилось в длительности (числа), нет ли «хвостовой тишины»;
+- grep: `1.10f`, `minDurationFromText`, `Random()` в synthesize — отсутствуют;
+- grep: второй `SupertonicEngine()` — отсутствует;
+- тест сегментации 200 тыс. символов < 300 мс (JVM-тест), смещения точные.
