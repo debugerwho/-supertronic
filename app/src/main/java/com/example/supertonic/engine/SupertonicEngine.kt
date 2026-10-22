@@ -187,15 +187,17 @@ class SupertonicEngine {
             val dpVal = dpResult.get(0).value
             dpResult.close()
 
-            val rawDuration = when (dpVal) {
-                is Array<*> -> (dpVal[0] as? FloatArray)?.get(0) ?: 1.5f
-                is FloatArray -> dpVal[0]
-                else -> 1.5f
+            val rawDuration = extractFirstFloat(dpVal)
+            val fallbackDuration = (codePoints.size / 14.0f + 0.25f).coerceIn(0.5f, 15.0f)
+
+            // Duration in seconds: use model's predicted duration with a small 180ms boundary
+            // cushion so final consonants and room decay are never abruptly cut off,
+            // while keeping latentLen strictly compact for sub-second real-time inference.
+            val duration = if (rawDuration != null && rawDuration > 0.05f) {
+                (rawDuration * 1.05f + 0.18f).coerceIn(0.4f, 15.0f)
+            } else {
+                fallbackDuration
             }
-            // Ensure ample natural duration so short phrases (e.g. "Привет!", "Да.")
-            // and word endings never get swallowed by insufficient flow matching temporal frames.
-            val minDurationFromText = (codePoints.size * 0.09f + 0.35f).coerceAtLeast(1.2f)
-            val duration = max(rawDuration * 1.10f, minDurationFromText)
 
             // 3. Text Encoder
             val textEncInputs = mapOf(
@@ -212,6 +214,8 @@ class SupertonicEngine {
             val wavLenMax = (duration * sampleRate).toLong()
             val latentLen = max(1, ((wavLenMax + chunkSize - 1) / chunkSize).toInt())
             val latentDim = config.totalLatentDim // 144
+
+            Log.d(tag, "Inference for chunk: length=${codePoints.size} chars, duration=${duration}s, latentLen=$latentLen, steps=$totalSteps")
 
             val totalLatentElements = latentDim * latentLen
             val noisyLatentFloats = FloatArray(totalLatentElements)
@@ -274,11 +278,7 @@ class SupertonicEngine {
             val wavBatch = vocoderResult.get(0).value
             vocoderResult.close()
 
-            val rawSamples: FloatArray = when (wavBatch) {
-                is Array<*> -> wavBatch[0] as FloatArray
-                is FloatArray -> wavBatch
-                else -> FloatArray(0)
-            }
+            val rawSamples: FloatArray = extractFloatArray(wavBatch)
 
             // Preserve 100% of vocoder output samples with natural room decay
             val targetSampleCount = if (rawSamples.isNotEmpty()) {
@@ -403,6 +403,45 @@ class SupertonicEngine {
             }
         }
         return sb.toString()
+    }
+
+    fun isLoadedWithThreads(threads: Int): Boolean = isLoaded && currentThreads == threads
+
+    private fun extractFirstFloat(value: Any?): Float? {
+        return when (value) {
+            null -> null
+            is Float -> value
+            is Double -> value.toFloat()
+            is Number -> value.toFloat()
+            is FloatArray -> value.firstOrNull()
+            is DoubleArray -> value.firstOrNull()?.toFloat()
+            is Array<*> -> {
+                for (elem in value) {
+                    val res = extractFirstFloat(elem)
+                    if (res != null) return res
+                }
+                null
+            }
+            else -> null
+        }
+    }
+
+    private fun extractFloatArray(value: Any?): FloatArray {
+        return when (value) {
+            is FloatArray -> value
+            is Array<*> -> {
+                if (value.isEmpty()) return FloatArray(0)
+                when (val first = value[0]) {
+                    is FloatArray -> first
+                    is Array<*> -> {
+                        if (first.isEmpty()) FloatArray(0)
+                        else (first[0] as? FloatArray) ?: FloatArray(0)
+                    }
+                    else -> FloatArray(0)
+                }
+            }
+            else -> FloatArray(0)
+        }
     }
 
     @Synchronized

@@ -5,6 +5,9 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.IBinder
@@ -13,7 +16,12 @@ import android.util.Log
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.supertonic.document.DocumentChapter
+import com.example.supertonic.data.DocumentChapterMetadata
+import com.example.supertonic.data.DocumentMetadata
+import com.example.supertonic.data.DocumentStore
+import com.example.supertonic.data.ParagraphItem
+import com.example.supertonic.data.ReadingSession
+import com.example.supertonic.data.SessionStore
 import com.example.supertonic.document.DocumentParser
 import com.example.supertonic.engine.CalibrationReport
 import com.example.supertonic.engine.CpuAffinityManager
@@ -26,12 +34,10 @@ import com.example.supertonic.language.LanguageDetector
 import com.example.supertonic.playback.PlaybackState
 import com.example.supertonic.playback.PlaybackStatus
 import com.example.supertonic.playback.SupertonicPlaybackService
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -50,25 +56,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val modelManager = ModelManager(application)
     val calibrator = PerformanceCalibrator(application)
     val cpuAffinity = CpuAffinityManager(application)
+    val documentStore = DocumentStore(application)
+    val sessionStore = SessionStore(application)
 
     private var playbackService: SupertonicPlaybackService? = null
     private var isBound = false
 
     val downloadState: StateFlow<ModelDownloadState> = modelManager.downloadState
+    val currentEngineThreads: Int
+        get() = playbackService?.engine?.currentThreads ?: cpuAffinity.getActiveThreadCount()
 
-    // Editor & Speech Settings
-    val inputText = MutableStateFlow("Привет! Это автономный синтезатор речи Supertonic 3. Выделите любой текст в другом приложении, импортируйте документ (TXT, PDF, EPUB) или вставьте текст сюда, чтобы начать быстрое и плавное чтение без интернета.")
-    val selectedLang = MutableStateFlow("auto") // "auto" or language code
-    val detectedLang = MutableStateFlow("ru")
-    val selectedVoice = MutableStateFlow("F1")
-    val synthesisSteps = MutableStateFlow(3) // 2, 3, 5, 8
-    val speechSpeed = MutableStateFlow(1.0f) // 0.8, 1.0, 1.3, 1.5, 2.0
-    val overlayEnabled = MutableStateFlow(true)
+    // Document and Paragraphs on-disk management
+    val currentDocMetadata = MutableStateFlow<DocumentMetadata?>(null)
+    val currentChapterIndex = MutableStateFlow(0)
+    val currentChapterText = MutableStateFlow("")
+    val currentParagraphs = MutableStateFlow<List<ParagraphItem>>(emptyList())
+    val currentParagraphIndex = MutableStateFlow(0)
+    val documentStats = MutableStateFlow("0 симв. · 0 слов")
 
     // Document Import State
-    val importedDocumentTitle = MutableStateFlow<String?>(null)
-    val documentChapters = MutableStateFlow<List<DocumentChapter>>(emptyList())
     val isImportingDocument = MutableStateFlow(false)
+    val importProgress = MutableStateFlow<String?>(null)
+
+    // Speech Settings
+    val selectedLang = MutableStateFlow("auto")
+    val detectedLang = MutableStateFlow("ru")
+    val selectedVoice = MutableStateFlow("F1")
+    val synthesisSteps = MutableStateFlow(3)
+    val speechSpeed = MutableStateFlow(1.0f)
+    val overlayEnabled = MutableStateFlow(true)
 
     // CPU Affinity Cores State
     val availableCores = MutableStateFlow<List<CpuCoreInfo>>(cpuAffinity.getAvailableCores())
@@ -88,9 +104,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _servicePlaybackState = MutableStateFlow(PlaybackState())
     val servicePlaybackState: StateFlow<PlaybackState> = _servicePlaybackState.asStateFlow()
 
-    // Independent preview player for saved library tracks (does not interrupt active speech inference)
     private var libraryMediaPlayer: MediaPlayer? = null
     val currentlyPlayingTrack = MutableStateFlow<SavedAudioTrack?>(null)
+
+    private var langDetectJob: Job? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -102,6 +119,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 viewModelScope.launch {
                     s.playbackState.collect { state ->
                         _servicePlaybackState.value = state
+                        updateActiveParagraph(state.currentSentenceStart)
                     }
                 }
             }
@@ -116,7 +134,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     init {
         bindPlaybackService()
         refreshSavedTracks()
-        updateLanguageDetection(inputText.value)
+
+        // Initialize document from session or default intro
+        viewModelScope.launch {
+            initInitialDocument()
+        }
+
+        // Auto-save session position every 5 seconds
+        viewModelScope.launch {
+            while (isActive) {
+                delay(5000)
+                saveCurrentSession()
+            }
+        }
+    }
+
+    private suspend fun initInitialDocument() {
+        val restoredSession = sessionStore.loadSession()
+        if (restoredSession != null) {
+            val meta = documentStore.loadMetadata(restoredSession.documentId)
+            if (meta != null) {
+                selectedVoice.value = restoredSession.voice
+                synthesisSteps.value = restoredSession.steps
+                speechSpeed.value = restoredSession.speed
+                selectedLang.value = restoredSession.lang
+                loadChapterInternal(meta, restoredSession.chapterIndex)
+                return
+            }
+        }
+
+        // Default introduction text stored to DocumentStore
+        val defaultIntro = "Привет! Это автономный синтезатор речи Supertonic 3.\n\n" +
+                "Выделите любой текст в другом приложении, импортируйте документ (TXT, PDF, EPUB) или откройте экран «Текст», чтобы начать быстрое и плавное чтение без интернета.\n\n" +
+                "Все вычисления выполняются локально на вашем процессоре с использованием ONNX Runtime."
+        val meta = documentStore.saveDocument(
+            title = "Добро пожаловать",
+            sourceUri = null,
+            fullText = defaultIntro,
+            chapters = listOf(DocumentChapterMetadata(title = "Введение", charStart = 0, charEnd = defaultIntro.length))
+        )
+        loadChapterInternal(meta, 0)
     }
 
     fun bindPlaybackService() {
@@ -125,14 +182,110 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         getApplication<Application>().bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
     }
 
-    fun onTextChange(newText: String) {
-        inputText.value = newText
-        updateLanguageDetection(newText)
+    private fun updateActiveParagraph(sentenceStart: Int) {
+        val paras = currentParagraphs.value
+        if (paras.isEmpty()) return
+        val found = paras.indexOfFirst { sentenceStart >= it.charStart && sentenceStart < it.charEnd }
+        if (found != -1 && found != currentParagraphIndex.value) {
+            currentParagraphIndex.value = found
+        }
     }
 
-    private fun updateLanguageDetection(text: String) {
-        val result = LanguageDetector.detectLanguage(text, priorityRussian = true)
-        detectedLang.value = result.detectedLang
+    fun scheduleLanguageDetection(text: String) {
+        langDetectJob?.cancel()
+        langDetectJob = viewModelScope.launch(Dispatchers.Default) {
+            delay(300)
+            val sample = text.take(4000)
+            if (sample.isNotBlank()) {
+                val res = LanguageDetector.detectLanguage(sample, priorityRussian = true)
+                detectedLang.value = res.detectedLang
+            }
+        }
+    }
+
+    fun loadChapter(chapterIndex: Int) {
+        val meta = currentDocMetadata.value ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            loadChapterInternal(meta, chapterIndex)
+        }
+    }
+
+    private suspend fun loadChapterInternal(meta: DocumentMetadata, chapterIndex: Int) = withContext(Dispatchers.IO) {
+        val clampedIndex = chapterIndex.coerceIn(0, (meta.chapters.size - 1).coerceAtLeast(0))
+        val chap = meta.chapters.getOrNull(clampedIndex) ?: meta.chapters.first()
+        val text = documentStore.loadChapterText(meta.id, chap.charStart, chap.charEnd)
+        val paragraphs = DocumentStore.splitIntoParagraphs(text, baseOffset = 0)
+
+        val words = text.split("\\s+".toRegex()).count { it.isNotBlank() }
+        val stats = "${text.length} симв. · $words слов"
+
+        withContext(Dispatchers.Main) {
+            currentDocMetadata.value = meta
+            currentChapterIndex.value = clampedIndex
+            currentChapterText.value = text
+            currentParagraphs.value = paragraphs
+            currentParagraphIndex.value = 0
+            documentStats.value = stats
+            scheduleLanguageDetection(text)
+        }
+    }
+
+    fun importDocument(uri: Uri, fileName: String) {
+        isImportingDocument.value = true
+        importProgress.value = "Чтение файла книги..."
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val parsed = DocumentParser.parseUri(getApplication(), uri, fileName)
+                if (parsed.fullText.isNotBlank()) {
+                    withContext(Dispatchers.Main) {
+                        importProgress.value = "Сохранение документа на диск..."
+                    }
+                    var charOffset = 0
+                    val metaChapters = parsed.chapters.map { c ->
+                        val start = charOffset
+                        val end = start + c.text.length
+                        charOffset = end
+                        DocumentChapterMetadata(
+                            title = c.title,
+                            charStart = start,
+                            charEnd = end
+                        )
+                    }
+                    val meta = documentStore.saveDocument(
+                        title = parsed.title,
+                        sourceUri = uri.toString(),
+                        fullText = parsed.fullText,
+                        chapters = metaChapters
+                    )
+                    loadChapterInternal(meta, 0)
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Document import error", e)
+            } finally {
+                withContext(Dispatchers.Main) {
+                    isImportingDocument.value = false
+                    importProgress.value = null
+                }
+            }
+        }
+    }
+
+    fun saveManualText(title: String, text: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val meta = documentStore.saveDocument(
+                title = title.ifBlank { "Заметка" },
+                sourceUri = null,
+                fullText = text,
+                chapters = emptyList()
+            )
+            loadChapterInternal(meta, 0)
+        }
+    }
+
+    fun getAvailableVoices(): List<String> {
+        val installed = modelManager.getInstalledVoiceIds()
+        return if (installed.isNotEmpty()) installed else listOf("F1", "F2", "M1", "M2")
     }
 
     fun togglePlayPause() {
@@ -147,7 +300,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val langToUse = if (selectedLang.value == "auto") detectedLang.value else selectedLang.value
             val showOverlay = overlayEnabled.value && Settings.canDrawOverlays(getApplication())
             service.playText(
-                text = inputText.value,
+                text = currentChapterText.value,
                 lang = langToUse,
                 voiceId = selectedVoice.value,
                 steps = synthesisSteps.value,
@@ -159,6 +312,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopPlayback() {
         playbackService?.stop()
+    }
+
+    fun retrySynthesis() {
+        playbackService?.retrySynthesis()
     }
 
     fun seekToChunk(targetIndex: Int) {
@@ -182,28 +339,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         playbackService?.setPlaybackSpeed(newSpeed)
     }
 
-    // --- Document Import --- //
-
-    fun importDocument(uri: Uri, fileName: String) {
-        isImportingDocument.value = true
-        viewModelScope.launch {
-            val parsed = DocumentParser.parseUri(getApplication(), uri, fileName)
-            if (parsed.fullText.isNotBlank()) {
-                inputText.value = parsed.fullText
-                importedDocumentTitle.value = parsed.title
-                documentChapters.value = parsed.chapters
-                updateLanguageDetection(parsed.fullText)
-            }
-            isImportingDocument.value = false
-        }
+    fun setOverlayEnabled(enabled: Boolean) {
+        overlayEnabled.value = enabled
     }
 
-    fun selectChapter(chapter: DocumentChapter) {
-        inputText.value = chapter.text
-        updateLanguageDetection(chapter.text)
-    }
-
-    // --- CPU Core Affinity --- //
+    // --- CPU Settings & Calibration --- //
 
     fun toggleCore(coreId: Int, isEnabled: Boolean) {
         val currentMask = cpuAffinity.getSavedCoreMask()
@@ -220,8 +360,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         cpuAffinity.applyPreset(preset)
         availableCores.value = cpuAffinity.getAvailableCores()
     }
-
-    // --- Calibration --- //
 
     fun startModelDownload() {
         viewModelScope.launch {
@@ -248,32 +386,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // --- Decoupled Audio File Generation & External Player --- //
 
-    /**
-     * Independent Batch File Generation:
-     * Synthesizes text directly to audio file at maximum CPU speed without real-time pacing,
-     * and without interfering with any ongoing audio playback.
-     */
     fun startBackgroundBatchExport(format: String = "m4a") {
-        val service = playbackService ?: return
-        val text = inputText.value.trim()
-        if (text.isEmpty()) {
+        val service = playbackService
+        val textToExport = currentChapterText.value
+        if (service == null || textToExport.isBlank()) {
             exportStatusMessage.value = "Нет текста для создания файла"
             return
         }
 
+        val exportDir = File(getApplication<Application>().filesDir, "saved_recordings").apply { mkdirs() }
+        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val targetFile = File(exportDir, "audio_${timeStamp}.$format")
+
         isExporting.value = true
         exportProgress.value = 0.05f
-        exportStatusMessage.value = "Создание аудиофайла в фоне..."
-
-        val libraryDir = File(getApplication<Application>().filesDir, "saved_recordings").apply { mkdirs() }
-        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-        val safeTitle = (importedDocumentTitle.value ?: text.take(20)).replace(Regex("[^a-zA-Zа-яА-Я0-9]"), "_")
-        val targetFile = File(libraryDir, "audio_${safeTitle}_$timeStamp.$format")
+        exportStatusMessage.value = "Создание аудиофайла в памяти и кодирование в $format..."
 
         val langToUse = if (selectedLang.value == "auto") detectedLang.value else selectedLang.value
 
         service.startIndependentBatchExport(
-            text = text,
+            text = textToExport,
             lang = langToUse,
             voiceId = selectedVoice.value,
             steps = synthesisSteps.value,
@@ -295,25 +427,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun exportAndOpenInVlc(context: Context, format: String = "m4a") {
-        val service = playbackService ?: return
-        val text = inputText.value.trim()
-        if (text.isEmpty()) {
+        val service = playbackService
+        val textToExport = currentChapterText.value
+        if (service == null || textToExport.isBlank()) {
             exportStatusMessage.value = "Нет текста для открытия в VLC"
             return
         }
+
+        val exportDir = File(getApplication<Application>().filesDir, "saved_recordings").apply { mkdirs() }
+        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val targetFile = File(exportDir, "vlc_${timeStamp}.$format")
 
         isExporting.value = true
         exportProgress.value = 0.05f
         exportStatusMessage.value = "Озвучивание для VLC в фоне..."
 
-        val libraryDir = File(getApplication<Application>().filesDir, "saved_recordings").apply { mkdirs() }
-        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-        val safeTitle = (importedDocumentTitle.value ?: text.take(20)).replace(Regex("[^a-zA-Zа-яА-Я0-9]"), "_")
-        val targetFile = File(libraryDir, "audio_${safeTitle}_$timeStamp.$format")
         val langToUse = if (selectedLang.value == "auto") detectedLang.value else selectedLang.value
 
         service.startIndependentBatchExport(
-            text = text,
+            text = textToExport,
             lang = langToUse,
             voiceId = selectedVoice.value,
             steps = synthesisSteps.value,
@@ -360,7 +492,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         savedTracks.value = files?.map { f ->
             SavedAudioTrack(
                 file = f,
-                title = f.nameWithoutExtension.removePrefix("audio_"),
+                title = f.nameWithoutExtension.removePrefix("audio_").removePrefix("vlc_"),
                 format = f.extension.uppercase(),
                 sizeBytes = f.length(),
                 dateModified = f.lastModified()
@@ -378,7 +510,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
+            // Pause book playback when track starts per Task 4
+            playbackService?.pause()
+
+            val audioManager = getApplication<Application>().getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+
+            val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(audioAttributes)
+                .build()
+            audioManager.requestAudioFocus(focusRequest)
+
             libraryMediaPlayer = MediaPlayer().apply {
+                setAudioAttributes(audioAttributes)
                 setDataSource(track.file.absolutePath)
                 prepare()
                 start()
@@ -407,8 +554,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshSavedTracks()
     }
 
-    fun clearCache() {
-        playbackService?.cache?.clear()
+    fun onAppPause() {
+        viewModelScope.launch {
+            saveCurrentSession()
+        }
+    }
+
+    private suspend fun saveCurrentSession() {
+        val meta = currentDocMetadata.value ?: return
+        val state = servicePlaybackState.value
+        val session = ReadingSession(
+            documentId = meta.id,
+            chapterIndex = currentChapterIndex.value,
+            chunkIndex = state.currentChunkIndex,
+            sampleOffset = 0L,
+            voice = selectedVoice.value,
+            steps = synthesisSteps.value,
+            speed = speechSpeed.value,
+            lang = selectedLang.value
+        )
+        sessionStore.saveSession(session)
     }
 
     override fun onCleared() {

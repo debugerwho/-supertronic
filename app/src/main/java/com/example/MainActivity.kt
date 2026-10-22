@@ -138,6 +138,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onPause() {
+        super.onPause()
+        viewModel.onAppPause()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
@@ -161,10 +166,10 @@ class MainActivity : ComponentActivity() {
         }
 
         if (!incomingText.isNullOrBlank()) {
-            viewModel.onTextChange(incomingText)
+            viewModel.saveManualText("Входящий текст", incomingText)
             Toast.makeText(this, "Текст загружен в Supertonic Reader", Toast.LENGTH_SHORT).show()
 
-            // If model is ready, automatically begin reading
+            // If model is ready, begin reading
             if (viewModel.modelManager.checkInstalledState()) {
                 viewModel.togglePlayPause()
             }
