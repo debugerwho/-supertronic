@@ -1,0 +1,2096 @@
+diff --git a/AI_STUDIO_STATE.md b/AI_STUDIO_STATE.md
+index ded1159..07cbf03 100644
+--- a/AI_STUDIO_STATE.md
++++ b/AI_STUDIO_STATE.md
+@@ -11,7 +11,7 @@
+   - Удален класс `PcmDiskCache.kt` и все вызовы.
+   - Удалена запись `session_spool_*.pcm` и временных `batch_export_*.pcm`.
+   - При старте `SupertonicPlaybackService` выполняет одноразовую очистку устаревших `.pcm` файлов в `cacheDir`.
+-  - Промежуточный синтез и пакетный экспорт работают исключительно в RAM (`List<ByteArray>`), запись ведется только в конечный целевой файл (.m4a / .wav).
++  - Промежуточный синтез и пакетный экспорт работают исключительно в RAM, запись ведется только в конечный целевой файл (.m4a / .wav). _(Сессия 2.1: экспорт больше не копит `List<ByteArray>` — PCM сразу уходит в потоковый кодировщик.)_
+ - **Ошибка синтеза не маскируется (Задача 3):**
+   - Удалена подстановка тишины (`250ms silence`).
+   - При ошибке `synthesizeChunk`: статус переходит в `PlaybackStatus.ERROR`, выводится сообщение с номером фразы (напр., «Ошибка синтеза фразы №3»), чанк не считается готовым, синтез останавливается.
+@@ -76,3 +76,60 @@
+ 
+ ### 5. Следующий шаг (Сессия 2)
+ - Оптимизация инференса ONNX Runtime, многопоточность синтеза, калибровка производительности под процессор и буферизация аудиопотока.
++
++---
++
++## Сессия 2: ядро движка и RAM-аудио (коммит `cdbb498`)
++
++### 1. Сделано
++- **Слой `audio/` вместо `AudioTrackPlayer`:** `AudioTrackSink` (один `AudioTrack`, запись слайсами ≤100 мс, `PlaybackParams` без изменения питча), `PcmRing` (окно 45 с назад / 10 мин вперёд), `PlaybackClock` (позиция в сэмплах), `SynthesisScheduler` (P0 текущий → P1 +3 → P2 окно → P3 seek → P4 остаток, счётчик поколений).
++- **`PcmStore`:** off-heap `ByteBuffer.allocateDirect` блоками 4 МБ, LRU-вытеснение блоков, счётчики hit/miss, бюджет по умолчанию 128 МБ.
++- **`EngineHost`:** единственный экземпляр `OnnxSpeechEngine` на процесс, `Mutex` вокруг `load`/`withEngine` (инференс сериализован), `StateFlow` для `isLoaded/currentThreads/voiceStyles`.
++- **`core/SourceIndex`:** связка «абзац ↔ чанк ↔ сэмпл», таймлайн `MM:SS / ≈MM:SS`.
++- **Точные длительности:** `duration = rawDuration / speed` (эвристики 1.05/0.18 удалены), шум через `ThreadLocalRandom`.
++- **Модель:** кэш размеров в `SharedPreferences` с TTL 7 дней, HEAD не чаще одного раза на процесс.
++- **Экспорт:** предупреждение при нехватке RAM, экспорт не блокирует воспроизведение.
++- **Тесты:** +93 строки (`PcmStore`, `PcmRing`, `SourceIndex`, WAV-заголовок).
++
++### 2. Не проверено в реальном окружении
++- Фактическая задержка старта воспроизведения и отсутствие разрывов на реальном устройстве.
++- Реальный прирост от `totalSteps = 2` на слабых SoC.
++
++### 3. Технические долги на момент коммита
++- `domain/ReadSession.kt` — мёртвый дубль состояния (удалён в 2.1).
++- Экспорт копил весь PCM в `List<ByteArray>` (исправлено в 2.1).
++
++---
++
++## Сессия 2.1: исправление дефектов код-ревью (ветка `arena/c3e0cbd7-supertronic`)
++
++Источник задач: `docs/REVIEW_SESSION1_2026-10-22.md` (C1, M2–M4) и `docs/REVIEW_SESSION2_2026-10-22.md` (C1, C2, M1–M7).
++
++### 1. Исправлено
++
++| Дефект | Что изменено | Файлы |
++|---|---|---|
++| **C1 (сессия 2)** — после любого seek позиция уезжала вперёд на всё записанное аудио | `AudioTrackSink.flush()` теперь полностью сбрасывает счётчики кадров, а не пересчитывает `headOffsetFrames`; абсолютная позиция живёт только в `PlaybackClock` | `audio/AudioTrackSink.kt`, `audio/PlaybackClock.kt` |
++| Двойной `flush()` при seek, `retrySynthesis()` без восстановления базы | В `seekToChunk()` ровно один флаш (внутри `clock.resetToSample`); `retrySynthesis()` переустанавливает базу по текущему чанку | `SupertonicPlaybackService.kt` |
++| **C2 (сессия 2)** — тап по абзацу из IDLE всегда начинал с начала | `playText(..., startParagraphIndex)`: чанк абзаца резолвится внутри `prepJob` после сегментации; UI больше не зовёт `seekToParagraph` сразу после старта | `SupertonicPlaybackService.kt`, `ui/MainViewModel.kt` |
++| **M1** — пауза/резюм повторяли фразу | Пауза не сбрасывает буфер и запоминает точный байтовый offset; резюм продолжает запись с него (учтён «лишний» слайс, успевший уйти после отмены) | `SupertonicPlaybackService.kt` |
++| Гонка «пауза во время блокирующей записи» | `pause()`/`stop()` увеличивают `generationId` — только это останавливает цикл записи, отмена корутины его не прерывает | `SupertonicPlaybackService.kt` |
++| **M2 (сессии 1 и 2)** — экспорт держал всю книгу в `List<ByteArray>` | Новые потоковые писатели `openM4aWriter`/`openWavWriter`: чанк сразу кодируется и пишется в файл. Отказ «>400 МБ RAM» больше не нужен и убран. Пиковый расход — один чанк + буферы кодека | `playback/MediaCodecExporter.kt`, `SupertonicPlaybackService.kt` |
++| **M3** — 263 строки мёртвого `ReadSession` | Файл удалён; удалён и неиспользуемый `playback/PcmChunk.kt` | `domain/`, `playback/` |
++| **M4** — позиция обновлялась только на границах чанков, у MediaSession не было seek | Тикер позиции каждые 250 мс (`UI_TICK_MS`) во время записи; `ACTION_SEEK_TO/FAST_FORWARD/REWIND`, `onSeekTo`, реальные позиция и скорость в `PlaybackStateCompat`; `seekToSeconds()` в сервисе и VM | `SupertonicPlaybackService.kt`, `ui/MainViewModel.kt` |
++| **M5** — границы памяти `PcmStore` не применялись | `maxCapacityBytes` жёстко клампится в 64–256 МБ; `put()` отказывается от чанка больше блока вместо `BufferOverflowException` | `audio/PcmStore.kt` |
++| Аллокация `ByteArray` на каждый чанк в цикле записи | `copyInto()`/`copyChunkInto()` + переиспользуемый буфер в сервисе | `audio/PcmStore.kt`, `audio/PcmRing.kt`, `SupertonicPlaybackService.kt` |
++| **M6** — точное сравнение с кэшированным HEAD-размером | ±2 % от ожидаемого размера; при расхождении с кэшем, но совпадении с манифестом — запись кэша инвалидируется (без вечного «файл повреждён») | `engine/ModelManager.kt` |
++| **M7** — `indexOfFirst` по всем абзацам на каждый чанк | Один курсор при построении индекса; бинарный поиск для `findChunkIndexBySample`/`findChunkIndexByParagraph`; обновление длительности пересчитывает только хвост | `core/SourceIndex.kt` |
++| Дрейф таймлайна при уточнении длительностей | `PlaybackClock.shiftBaseBy()` — база сдвигается на дельту `sampleStart` активного чанка | `audio/PlaybackClock.kt`, `SupertonicPlaybackService.kt` |
++| Обход `Mutex` через `EngineHost.rawEngine` | Доступ стал `internal`, из сервиса убран публичный `engine`; `EngineHost.load()` идемпотентен (не перезагружает ~400 МБ модель на каждый вход в чтение) | `engine/EngineHost.kt`, `SupertonicPlaybackService.kt` |
++
++### 2. Тесты
++Добавлены: сдвиг смещений при уточнении длительности, монотонность `findChunkIndexBySample`, поиск по нескольким абзацам, `PcmStore.copyInto` + кламп бюджета.
++Запуск: `./gradlew :app:testDebugUnitTest` (в песочнице Android SDK нет — тесты не запускались).
++
++### 3. Что осталось на Сессию 3 (P3)
++- Три фазы экспорта с Media3 `Mp4Muxer` и выбор кодека/битрейта (сейчас — потоковый `MediaCodec`/`MediaMuxer`, файл в RAM не держится).
++- 31 язык + `na`: сквозная проверка `LanguageDetector` и сегментера.
++- Пользовательский выбор ядер: реальная привязка потоков (вне AI Studio) + `/proc`-наблюдение.
++- Обновление `docs/REVIEW_SESSION*.md` после прогона на устройстве.
+diff --git a/app/src/main/java/com/example/supertonic/audio/AudioTrackSink.kt b/app/src/main/java/com/example/supertonic/audio/AudioTrackSink.kt
+index 7096967..47240ae 100644
+--- a/app/src/main/java/com/example/supertonic/audio/AudioTrackSink.kt
++++ b/app/src/main/java/com/example/supertonic/audio/AudioTrackSink.kt
+@@ -119,32 +119,47 @@ class AudioTrackSink(
+         }
+     }
+ 
++    /**
++     * Drops all buffered audio and resets frame counters to zero.
++     *
++     * Frame counters must start from zero after a flush: absolute timeline position is owned by
++     * [PlaybackClock] (baseSampleOffset), and the sink only reports frames played *since* the flush.
++     * Keeping the old counters here made every seek jump the clock forward by the whole amount of
++     * audio written earlier in the session.
++     */
+     @Synchronized
+     fun flush() {
+-        val track = audioTrack ?: return
++        val track = audioTrack
+         try {
+-            track.pause()
+-            track.flush()
+-            val currentHead = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+-            headOffsetFrames = _totalWrittenFrames.get() - currentHead
+-            lastObservedHead = currentHead
++            if (track != null) {
++                track.pause()
++                track.flush()
++            }
+         } catch (e: Exception) {
+             Log.e(tag, "Error flushing AudioTrack", e)
++        } finally {
++            _totalWrittenFrames.set(0)
++            headOffsetFrames = 0L
++            lastObservedHead = 0L
++            isPlaying = false
+         }
+     }
+ 
+     @Synchronized
+     fun stop() {
+-        val track = audioTrack ?: return
++        val track = audioTrack
+         try {
+-            track.stop()
+-            track.flush()
++            if (track != null) {
++                track.stop()
++                track.flush()
++            }
++        } catch (e: Exception) {
++            Log.e(tag, "Error stopping AudioTrack", e)
++        } finally {
+             isPlaying = false
+             _totalWrittenFrames.set(0)
+             headOffsetFrames = 0L
+             lastObservedHead = 0L
+-        } catch (e: Exception) {
+-            Log.e(tag, "Error stopping AudioTrack", e)
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/example/supertonic/audio/PcmRing.kt b/app/src/main/java/com/example/supertonic/audio/PcmRing.kt
+index d3404cb..bd4ea90 100644
+--- a/app/src/main/java/com/example/supertonic/audio/PcmRing.kt
++++ b/app/src/main/java/com/example/supertonic/audio/PcmRing.kt
+@@ -1,8 +1,6 @@
+ package com.example.supertonic.audio
+ 
+ import com.example.supertonic.language.TextChunk
+-import java.util.Collections
+-import java.util.concurrent.ConcurrentHashMap
+ 
+ /**
+  * Sliding window manager for playback audio:
+@@ -17,15 +15,21 @@ class PcmRing(
+         const val ESTIMATED_CHARS_PER_SEC = 13.0f
+     }
+ 
+-    private val readyIndices = Collections.newSetFromMap(ConcurrentHashMap<Int, Boolean>())
+-
+     fun isReady(chunkIndex: Int): Boolean = pcmStore.has(chunkIndex)
+ 
+     fun getChunk(chunkIndex: Int): ByteArray? = pcmStore.get(chunkIndex)
+ 
++    fun sizeOf(chunkIndex: Int): Int? = pcmStore.sizeOf(chunkIndex)
++
++    /**
++     * Copies the chunk into a caller-owned buffer, avoiding a fresh allocation per chunk.
++     * @return bytes copied, or -1 when the chunk is absent or [dst] is too small.
++     */
++    fun copyChunkInto(chunkIndex: Int, dst: ByteArray, dstOffset: Int = 0): Int =
++        pcmStore.copyInto(chunkIndex, dst, dstOffset)
++
+     fun putChunk(chunkIndex: Int, pcm: ByteArray, durationSec: Float, sampleRate: Int = 44100) {
+         pcmStore.put(chunkIndex, pcm, durationSec, sampleRate)
+-        readyIndices.add(chunkIndex)
+     }
+ 
+     /**
+@@ -66,12 +70,10 @@ class PcmRing(
+      */
+     fun advance(currentIndex: Int, chunks: List<TextChunk>) {
+         val window = calculateWindowIndices(currentIndex, chunks)
+-        readyIndices.retainAll(window)
+         pcmStore.evictExcept(window)
+     }
+ 
+     fun clear() {
+-        readyIndices.clear()
+         pcmStore.clear()
+     }
+ }
+diff --git a/app/src/main/java/com/example/supertonic/audio/PcmStore.kt b/app/src/main/java/com/example/supertonic/audio/PcmStore.kt
+index 1f1c6b3..64b16e8 100644
+--- a/app/src/main/java/com/example/supertonic/audio/PcmStore.kt
++++ b/app/src/main/java/com/example/supertonic/audio/PcmStore.kt
+@@ -22,7 +22,7 @@ data class PcmChunkMeta(
+  * Off-heap PCM chunk store using 4 MB DirectByteBuffers with LRU eviction and memory bounds.
+  */
+ class PcmStore(
+-    var maxCapacityBytes: Long = DEFAULT_MAX_CAPACITY_BYTES
++    maxCapacityBytes: Long = DEFAULT_MAX_CAPACITY_BYTES
+ ) {
+     companion object {
+         const val BLOCK_SIZE: Int = 4 * 1024 * 1024 // 4 MB per block
+@@ -31,6 +31,15 @@ class PcmStore(
+         const val MAX_CAPACITY_BYTES_UPPER: Long = 256L * 1024 * 1024 // 256 MB
+     }
+ 
++    /**
++     * Memory budget, always clamped to [MIN_CAPACITY_BYTES]..[MAX_CAPACITY_BYTES_UPPER] so a bad
++     * preference can neither starve the playback buffer nor blow the process heap.
++     */
++    var maxCapacityBytes: Long = maxCapacityBytes.coerceIn(MIN_CAPACITY_BYTES, MAX_CAPACITY_BYTES_UPPER)
++        set(value) {
++            field = value.coerceIn(MIN_CAPACITY_BYTES, MAX_CAPACITY_BYTES_UPPER)
++        }
++
+     private class Block(
+         val id: Int,
+         val buffer: ByteBuffer,
+@@ -60,11 +69,32 @@ class PcmStore(
+ 
+     fun has(chunkIndex: Int): Boolean = chunkMap.containsKey(chunkIndex)
+ 
++    fun sizeOf(chunkIndex: Int): Int? = chunkMap[chunkIndex]?.length
++
+     fun get(chunkIndex: Int): ByteArray? {
++        val size = sizeOf(chunkIndex)
++        if (size == null) {
++            _missCount.incrementAndGet()
++            return null
++        }
++        val outBytes = ByteArray(size)
++        val copied = copyInto(chunkIndex, outBytes, 0)
++        return if (copied == size) outBytes else null
++    }
++
++    /**
++     * Copies a stored chunk into [dst] without allocating a new array (hot path of the playback loop).
++     *
++     * @return number of bytes copied, or -1 when the chunk is missing or [dst] is too small.
++     */
++    fun copyInto(chunkIndex: Int, dst: ByteArray, dstOffset: Int = 0): Int {
+         val meta = chunkMap[chunkIndex]
+         if (meta == null) {
+             _missCount.incrementAndGet()
+-            return null
++            return -1
++        }
++        if (dstOffset < 0 || dstOffset + meta.length > dst.size) {
++            return -1
+         }
+ 
+         synchronized(lock) {
+@@ -73,20 +103,25 @@ class PcmStore(
+             if (block == null) {
+                 chunkMap.remove(chunkIndex)
+                 _missCount.incrementAndGet()
+-                return null
++                return -1
+             }
+ 
+-            val outBytes = ByteArray(meta.length)
+             val readBuf = block.buffer.duplicate()
+             readBuf.position(meta.offset)
+-            readBuf.get(outBytes, 0, meta.length)
++            readBuf.get(dst, dstOffset, meta.length)
+             _hitCount.incrementAndGet()
+-            return outBytes
++            return meta.length
+         }
+     }
+ 
+     fun put(chunkIndex: Int, pcm: ByteArray, durationSec: Float, sampleRate: Int = 44100) {
+         if (pcm.isEmpty()) return
++        if (pcm.size > BLOCK_SIZE) {
++            // A single chunk is never that long (≈45 s of 44.1 kHz mono PCM); refusing beats a
++            // BufferOverflowException in the middle of a write.
++            android.util.Log.e("PcmStore", "Chunk $chunkIndex is ${pcm.size} bytes, larger than block $BLOCK_SIZE")
++            return
++        }
+ 
+         synchronized(lock) {
+             // If already present, remove old reference
+diff --git a/app/src/main/java/com/example/supertonic/audio/PlaybackClock.kt b/app/src/main/java/com/example/supertonic/audio/PlaybackClock.kt
+index 047dbe4..a0111ed 100644
+--- a/app/src/main/java/com/example/supertonic/audio/PlaybackClock.kt
++++ b/app/src/main/java/com/example/supertonic/audio/PlaybackClock.kt
+@@ -1,7 +1,12 @@
+ package com.example.supertonic.audio
+ 
++import kotlin.math.max
++
+ /**
+  * Clock tracking exact sample-based playback position, underruns, and timing.
++ *
++ * The absolute position is `baseSampleOffset + frames played since the last sink flush`.
++ * [AudioTrackSink.flush] resets its own frame counters, so a seek only has to move the base.
+  */
+ class PlaybackClock(
+     val sink: AudioTrackSink,
+@@ -11,6 +16,9 @@ class PlaybackClock(
+ 
+     val isPlaying: Boolean get() = sink.isPlaying
+ 
++    /** Sample offset of the point the sink currently plays (set by the last seek). */
++    val baseSample: Long get() = baseSampleOffset
++
+     val currentSample: Long
+         get() = baseSampleOffset + sink.getPlayedFrames()
+ 
+@@ -20,9 +28,26 @@ class PlaybackClock(
+     val underrunCount: Int
+         get() = sink.getUnderruns()
+ 
++    /**
++     * Flushes the sink and anchors the clock at [sampleOffset].
++     *
++     * The caller is responsible for starting playback of the chunk that begins at that sample.
++     */
+     fun resetToSample(sampleOffset: Long) {
+         sink.flush()
+-        baseSampleOffset = sampleOffset
++        baseSampleOffset = max(0L, sampleOffset)
++    }
++
++    /**
++     * Moves the anchor without touching the sink.
++     *
++     * Used when the timeline index is recalculated after a chunk got its exact duration: the
++     * mapping between chunk index and sample offset changes, so the anchor has to follow it
++     * instead of letting the displayed position drift.
++     */
++    fun shiftBaseBy(samples: Long) {
++        if (samples == 0L) return
++        baseSampleOffset = max(0L, baseSampleOffset + samples)
+     }
+ 
+     fun reset() {
+diff --git a/app/src/main/java/com/example/supertonic/core/SourceIndex.kt b/app/src/main/java/com/example/supertonic/core/SourceIndex.kt
+index 178512b..9b52d0b 100644
+--- a/app/src/main/java/com/example/supertonic/core/SourceIndex.kt
++++ b/app/src/main/java/com/example/supertonic/core/SourceIndex.kt
+@@ -21,6 +21,9 @@ data class IndexedChunkSpan(
+ 
+ /**
+  * Sample-accurate index connecting document paragraphs, text chunks, and audio timeline.
++ *
++ * Lookups are O(log n) and both index construction and duration updates are linear in the number
++ * of chunks (no per-chunk paragraph scans, no full re-layout for every synthesized chunk).
+  */
+ class SourceIndex(
+     val chunks: List<TextChunk>,
+@@ -34,14 +37,34 @@ class SourceIndex(
+     private val spans: List<IndexedChunkSpan>
+ 
+     init {
+-        val spanList = mutableListOf<IndexedChunkSpan>()
++        val spanList = ArrayList<IndexedChunkSpan>(chunks.size)
++
++        // Paragraphs and chunks are both ordered by character offset, so a single moving cursor is
++        // enough: the previous implementation scanned every paragraph for every chunk (O(n·m)).
++        var paragraphCursor = 0
++
+         for (chunk in chunks) {
+-            // Find paragraph containing chunk start offset
+-            val pIdx = paragraphs.indexOfFirst { p ->
+-                chunk.startOffset >= p.charStart && chunk.startOffset <= p.charEnd
+-            }.coerceAtLeast(0)
++            if (paragraphs.isNotEmpty()) {
++                while (paragraphCursor + 1 < paragraphs.size &&
++                    chunk.startOffset > paragraphs[paragraphCursor].charEnd
++                ) {
++                    paragraphCursor++
++                }
++            }
++
++            val pIdx = if (paragraphs.isEmpty()) {
++                0
++            } else {
++                val candidate = paragraphs[paragraphCursor]
++                if (chunk.startOffset in candidate.charStart..candidate.charEnd) {
++                    paragraphCursor
++                } else {
++                    // Offset falls into a gap between paragraphs: keep the one that starts after it,
++                    // as long as it is not the last one; otherwise stay on the current paragraph.
++                    max(0, paragraphCursor)
++                }
++            }
+ 
+-            // Initial estimate for sample length based on character length
+             val estDurationSec = max(0.4f, chunk.text.length / ESTIMATED_CHARS_PER_SEC)
+             val estSamples = (estDurationSec * sampleRate).toLong()
+ 
+@@ -57,15 +80,26 @@ class SourceIndex(
+                 )
+             )
+         }
+-        recalculateSampleOffsets(spanList)
++
++        recalculateOffsets(spanList, 0)
+         spans = spanList
+     }
+ 
+-    private fun recalculateSampleOffsets(list: List<IndexedChunkSpan>) {
+-        var currentSample = 0L
+-        for (span in list) {
+-            span.sampleStart = currentSample
+-            currentSample += span.sampleLength
++    /**
++     * Recomputes sample starts from [fromIndex] to the end. Only spans at or after the changed chunk
++     * can move, so a duration update costs O(remaining chunks) instead of a full re-layout.
++     */
++    private fun recalculateOffsets(list: List<IndexedChunkSpan>, fromIndex: Int) {
++        if (list.isEmpty()) return
++        val start = fromIndex.coerceIn(0, list.size - 1)
++        var currentSample = if (start == 0) {
++            0L
++        } else {
++            list[start - 1].sampleStart + list[start - 1].sampleLength
++        }
++        for (i in start until list.size) {
++            list[i].sampleStart = currentSample
++            currentSample += list[i].sampleLength
+         }
+     }
+ 
+@@ -76,29 +110,62 @@ class SourceIndex(
+         val span = spans.getOrNull(chunkIndex) ?: return
+         span.sampleLength = (durationSec * sampleRate).toLong()
+         span.isSynthesized = true
+-        recalculateSampleOffsets(spans)
++        recalculateOffsets(spans, chunkIndex)
+     }
+ 
+     fun getSpan(chunkIndex: Int): IndexedChunkSpan? = spans.getOrNull(chunkIndex)
+ 
++    fun sampleStartOf(chunkIndex: Int): Long = spans.getOrNull(chunkIndex)?.sampleStart ?: 0L
++
++    /** Duration of the chunk in seconds (exact after synthesis, estimate before). */
++    fun durationSecondsOf(chunkIndex: Int): Float {
++        val span = spans.getOrNull(chunkIndex) ?: return 0f
++        return span.sampleLength.toFloat() / sampleRate.toFloat()
++    }
++
+     fun findChunkIndexByParagraph(paragraphIndex: Int): Int {
+-        val span = spans.find { it.paragraphIndex == paragraphIndex }
+-        return span?.chunkIndex ?: 0
++        // Paragraphs are ordered: binary search on the first span of the paragraph.
++        var low = 0
++        var high = spans.size - 1
++        var result = 0
++        while (low <= high) {
++            val mid = (low + high) ushr 1
++            val p = spans[mid].paragraphIndex
++            when {
++                p < paragraphIndex -> low = mid + 1
++                p > paragraphIndex -> high = mid - 1
++                else -> {
++                    result = mid
++                    high = mid - 1
++                }
++            }
++        }
++        return if (result in spans.indices) spans[result].chunkIndex else 0
+     }
+ 
+     fun findChunkIndexBySample(sampleOffset: Long): Int {
+         if (spans.isEmpty()) return 0
+         if (sampleOffset <= 0) return 0
+-        for (span in spans) {
+-            if (sampleOffset >= span.sampleStart && sampleOffset < span.sampleStart + span.sampleLength) {
+-                return span.chunkIndex
++
++        var low = 0
++        var high = spans.size - 1
++        var candidate = 0
++        while (low <= high) {
++            val mid = (low + high) ushr 1
++            if (spans[mid].sampleStart <= sampleOffset) {
++                candidate = mid
++                low = mid + 1
++            } else {
++                high = mid - 1
+             }
+         }
+-        return spans.last().chunkIndex
++        return spans[candidate].chunkIndex
+     }
+ 
+     fun getTotalEstimatedDurationSeconds(): Float {
+-        val totalSamples = spans.sumOf { it.sampleLength }
++        if (spans.isEmpty()) return 0f
++        val last = spans.last()
++        val totalSamples = last.sampleStart + last.sampleLength
+         return totalSamples.toFloat() / sampleRate.toFloat()
+     }
+ 
+diff --git a/app/src/main/java/com/example/supertonic/domain/ReadSession.kt b/app/src/main/java/com/example/supertonic/domain/ReadSession.kt
+deleted file mode 100644
+index 0f8d162..0000000
+--- a/app/src/main/java/com/example/supertonic/domain/ReadSession.kt
++++ /dev/null
+@@ -1,263 +0,0 @@
+-package com.example.supertonic.domain
+-
+-import android.util.Log
+-import com.example.supertonic.audio.AudioTrackSink
+-import com.example.supertonic.audio.PcmRing
+-import com.example.supertonic.audio.PlaybackClock
+-import com.example.supertonic.audio.SynthesisScheduler
+-import com.example.supertonic.core.SourceIndex
+-import com.example.supertonic.data.ParagraphItem
+-import com.example.supertonic.engine.VoiceStyle
+-import com.example.supertonic.language.TextChunk
+-import com.example.supertonic.language.TextSegmenter
+-import com.example.supertonic.playback.PlaybackStatus
+-import kotlinx.coroutines.*
+-import kotlinx.coroutines.flow.MutableStateFlow
+-import kotlinx.coroutines.flow.StateFlow
+-import kotlinx.coroutines.flow.asStateFlow
+-import java.util.concurrent.atomic.AtomicInteger
+-
+-/**
+- * High-level domain state of reading session
+- */
+-data class ReadSessionState(
+-    val status: PlaybackStatus = PlaybackStatus.IDLE,
+-    val currentChunkIndex: Int = 0,
+-    val totalChunks: Int = 0,
+-    val currentParagraphIndex: Int = 0,
+-    val currentSentenceText: String = "",
+-    val timelineDisplay: String = "00:00 / 00:00",
+-    val playbackProgress: Float = 0f,
+-    val currentSeconds: Float = 0f,
+-    val totalEstimatedSeconds: Float = 0f,
+-    val rtf: Float = 1.0f,
+-    val playbackSpeed: Float = 1.0f,
+-    val synthesizedChunksCount: Int = 0,
+-    val errorMessage: String? = null
+-)
+-
+-/**
+- * Domain orchestrator coordinating text segmentation, index mapping, off-heap audio,
+- * priority synthesis scheduler, and AudioTrack streaming sink.
+- */
+-class ReadSession(
+-    val pcmRing: PcmRing = PcmRing(),
+-    val sink: AudioTrackSink = AudioTrackSink(),
+-    private val scope: CoroutineScope
+-) {
+-    private val tag = "ReadSession"
+-
+-    val clock = PlaybackClock(sink)
+-    val scheduler = SynthesisScheduler(pcmRing, scope)
+-
+-    private val _sessionState = MutableStateFlow(ReadSessionState())
+-    val sessionState: StateFlow<ReadSessionState> = _sessionState.asStateFlow()
+-
+-    private var sourceIndex: SourceIndex? = null
+-    private var activeChunks: List<TextChunk> = emptyList()
+-    private val currentGen = AtomicInteger(0)
+-    private var playbackLoopJob: Job? = null
+-
+-    init {
+-        scheduler.onChunkSynthesized = { chunkIndex, durationSec, rtf ->
+-            sourceIndex?.updateSynthesizedChunk(chunkIndex, durationSec)
+-            val total = activeChunks.size
+-            val synthCount = activeChunks.count { pcmRing.isReady(it.index) }
+-            val curSec = clock.currentSeconds
+-            val timeline = sourceIndex?.formatTimeline(curSec) ?: "00:00 / 00:00"
+-
+-            _sessionState.value = _sessionState.value.copy(
+-                rtf = rtf,
+-                synthesizedChunksCount = synthCount,
+-                timelineDisplay = timeline,
+-                totalEstimatedSeconds = sourceIndex?.getTotalEstimatedDurationSeconds() ?: 0f
+-            )
+-        }
+-
+-        scheduler.onSynthesisError = { chunkIndex, message ->
+-            Log.e(tag, "Synthesis error for chunk $chunkIndex: $message")
+-            _sessionState.value = _sessionState.value.copy(
+-                status = PlaybackStatus.ERROR,
+-                errorMessage = message
+-            )
+-        }
+-    }
+-
+-    fun prepareDocument(
+-        text: String,
+-        paragraphs: List<ParagraphItem>,
+-        defaultLang: String = "ru",
+-        voiceStyle: VoiceStyle,
+-        steps: Int = 3,
+-        startIndex: Int = 0
+-    ) {
+-        playbackLoopJob?.cancel()
+-        scheduler.cancelAll()
+-        sink.stop()
+-        pcmRing.clear()
+-
+-        _sessionState.value = ReadSessionState(status = PlaybackStatus.PREPARING)
+-
+-        val chunks = TextSegmenter.segment(text, defaultLang = defaultLang, priorityRussian = true)
+-        if (chunks.isEmpty()) {
+-            _sessionState.value = ReadSessionState(status = PlaybackStatus.IDLE)
+-            return
+-        }
+-
+-        activeChunks = chunks
+-        val index = SourceIndex(chunks, paragraphs)
+-        sourceIndex = index
+-
+-        scheduler.updateContext(chunks, voiceStyle, steps)
+-
+-        val initialChunk = chunks.getOrElse(startIndex) { chunks.first() }
+-        val span = index.getSpan(initialChunk.index)
+-
+-        _sessionState.value = ReadSessionState(
+-            status = PlaybackStatus.BUFFERING,
+-            currentChunkIndex = initialChunk.index,
+-            totalChunks = chunks.size,
+-            currentParagraphIndex = span?.paragraphIndex ?: 0,
+-            currentSentenceText = initialChunk.text,
+-            timelineDisplay = index.formatTimeline(0f),
+-            totalEstimatedSeconds = index.getTotalEstimatedDurationSeconds()
+-        )
+-
+-        // Kick off scheduler
+-        scheduler.scheduleAround(initialChunk.index)
+-        startPlaybackStream(currentGen.incrementAndGet(), initialChunk.index)
+-    }
+-
+-    fun play() {
+-        if (_sessionState.value.status == PlaybackStatus.PAUSED) {
+-            val gen = currentGen.incrementAndGet()
+-            sink.play()
+-            _sessionState.value = _sessionState.value.copy(status = PlaybackStatus.PLAYING)
+-            startPlaybackStream(gen, _sessionState.value.currentChunkIndex)
+-        }
+-    }
+-
+-    fun pause() {
+-        playbackLoopJob?.cancel()
+-        sink.pause()
+-        _sessionState.value = _sessionState.value.copy(status = PlaybackStatus.PAUSED)
+-    }
+-
+-    fun seekToParagraph(paragraphIndex: Int) {
+-        val chunkIdx = sourceIndex?.findChunkIndexByParagraph(paragraphIndex) ?: 0
+-        seekToChunk(chunkIdx)
+-    }
+-
+-    fun seekToChunk(targetIndex: Int) {
+-        val total = activeChunks.size
+-        if (total == 0) return
+-        val clamped = targetIndex.coerceIn(0, total - 1)
+-
+-        val gen = currentGen.incrementAndGet()
+-        playbackLoopJob?.cancel()
+-        sink.flush()
+-
+-        val chunk = activeChunks[clamped]
+-        val span = sourceIndex?.getSpan(clamped)
+-        span?.let { clock.resetToSample(it.sampleStart) }
+-
+-        _sessionState.value = _sessionState.value.copy(
+-            status = if (pcmRing.isReady(clamped)) PlaybackStatus.PLAYING else PlaybackStatus.BUFFERING,
+-            currentChunkIndex = clamped,
+-            currentParagraphIndex = span?.paragraphIndex ?: 0,
+-            currentSentenceText = chunk.text
+-        )
+-
+-        scheduler.scheduleAround(clamped, userSeekTarget = clamped)
+-        startPlaybackStream(gen, clamped)
+-    }
+-
+-    fun setSpeed(speed: Float) {
+-        sink.playbackSpeed = speed
+-        _sessionState.value = _sessionState.value.copy(playbackSpeed = speed)
+-    }
+-
+-    private fun startPlaybackStream(gen: Int, startIndex: Int) {
+-        playbackLoopJob?.cancel()
+-        playbackLoopJob = scope.launch(Dispatchers.IO) {
+-            var currentIndex = startIndex
+-            sink.play()
+-
+-            while (currentIndex < activeChunks.size && currentGen.get() == gen) {
+-                // Wait for chunk if not synthesized yet (buffering)
+-                var pcmBytes = pcmRing.getChunk(currentIndex)
+-                while (pcmBytes == null && currentGen.get() == gen) {
+-                    if (_sessionState.value.status == PlaybackStatus.ERROR) return@launch
+-                    withContext(Dispatchers.Main) {
+-                        if (_sessionState.value.status != PlaybackStatus.ERROR) {
+-                            _sessionState.value = _sessionState.value.copy(status = PlaybackStatus.BUFFERING)
+-                        }
+-                    }
+-                    delay(40)
+-                    pcmBytes = pcmRing.getChunk(currentIndex)
+-                }
+-
+-                if (pcmBytes == null || currentGen.get() != gen) break
+-
+-                val chunk = activeChunks[currentIndex]
+-                val span = sourceIndex?.getSpan(currentIndex)
+-
+-                withContext(Dispatchers.Main) {
+-                    pcmRing.advance(currentIndex, activeChunks)
+-                    scheduler.scheduleAround(currentIndex)
+-
+-                    val curSec = clock.currentSeconds
+-                    val totalSec = sourceIndex?.getTotalEstimatedDurationSeconds() ?: 1f
+-                    val progress = (curSec / totalSec).coerceIn(0f, 1f)
+-
+-                    _sessionState.value = _sessionState.value.copy(
+-                        status = PlaybackStatus.PLAYING,
+-                        currentChunkIndex = chunk.index,
+-                        currentParagraphIndex = span?.paragraphIndex ?: 0,
+-                        currentSentenceText = chunk.text,
+-                        currentSeconds = curSec,
+-                        playbackProgress = progress,
+-                        timelineDisplay = sourceIndex?.formatTimeline(curSec) ?: "00:00 / 00:00"
+-                    )
+-                }
+-
+-                // Write chunk in <= 100 ms slices
+-                var writeOffset = 0
+-                while (writeOffset < pcmBytes.size && currentGen.get() == gen) {
+-                    val remaining = pcmBytes.size - writeOffset
+-                    val written = sink.writeSlice(pcmBytes, writeOffset, remaining)
+-                    if (written > 0) {
+-                        writeOffset += written
+-                    } else {
+-                        delay(20)
+-                    }
+-                }
+-
+-                currentIndex++
+-            }
+-
+-            // Await buffer drain at completion
+-            while (sink.getBufferedDurationSeconds() > 0.05f && currentGen.get() == gen && sink.isPlaying) {
+-                delay(40)
+-            }
+-
+-            if (currentGen.get() == gen && currentIndex >= activeChunks.size) {
+-                withContext(Dispatchers.Main) {
+-                    _sessionState.value = _sessionState.value.copy(
+-                        status = PlaybackStatus.COMPLETED,
+-                        playbackProgress = 1.0f
+-                    )
+-                }
+-            }
+-        }
+-    }
+-
+-    fun release() {
+-        currentGen.incrementAndGet()
+-        playbackLoopJob?.cancel()
+-        scheduler.cancelAll()
+-        sink.release()
+-        pcmRing.clear()
+-        _sessionState.value = ReadSessionState(status = PlaybackStatus.IDLE)
+-    }
+-}
+diff --git a/app/src/main/java/com/example/supertonic/engine/EngineHost.kt b/app/src/main/java/com/example/supertonic/engine/EngineHost.kt
+index 4714b77..d05e1d9 100644
+--- a/app/src/main/java/com/example/supertonic/engine/EngineHost.kt
++++ b/app/src/main/java/com/example/supertonic/engine/EngineHost.kt
+@@ -24,15 +24,35 @@ object EngineHost {
+     private val _voiceStyles = MutableStateFlow<List<VoiceStyle>>(emptyList())
+     val voiceStyles: StateFlow<List<VoiceStyle>> = _voiceStyles.asStateFlow()
+ 
+-    val rawEngine: SpeechEngine get() = onnxEngine
++    private var loadedDirPath: String? = null
++    private var loadedThreads: Int = -1
++
++    /** Direct engine access for legacy read-only callers. Inference must go through [withEngine]. */
++    internal val rawEngine: SpeechEngine get() = onnxEngine
+ 
+     fun getDiagnostics(): List<ChunkSynthesisDiagnostic> = onnxEngine.getDiagnostics()
+ 
+     suspend fun load(modelDir: File, numThreads: Int = 2): Boolean = mutex.withLock {
++        // Idempotent: re-entering reading must not reload the ~400 MB model with the same settings.
++        if (onnxEngine.isLoaded &&
++            loadedDirPath == modelDir.absolutePath &&
++            loadedThreads == numThreads
++        ) {
++            _isLoaded.value = true
++            return@withLock true
++        }
++
+         val result = onnxEngine.load(modelDir, numThreads)
+         _isLoaded.value = onnxEngine.isLoaded
+         _currentThreads.value = onnxEngine.currentThreads
+         _voiceStyles.value = onnxEngine.getVoiceStyles()
++        if (result) {
++            loadedDirPath = modelDir.absolutePath
++            loadedThreads = numThreads
++        } else {
++            loadedDirPath = null
++            loadedThreads = -1
++        }
+         result
+     }
+ 
+@@ -46,6 +66,8 @@ object EngineHost {
+ 
+     suspend fun close() = mutex.withLock {
+         onnxEngine.close()
++        loadedDirPath = null
++        loadedThreads = -1
+         _isLoaded.value = false
+         _voiceStyles.value = emptyList()
+     }
+diff --git a/app/src/main/java/com/example/supertonic/engine/ModelManager.kt b/app/src/main/java/com/example/supertonic/engine/ModelManager.kt
+index 4e1df5c..59c1543 100644
+--- a/app/src/main/java/com/example/supertonic/engine/ModelManager.kt
++++ b/app/src/main/java/com/example/supertonic/engine/ModelManager.kt
+@@ -187,13 +187,29 @@ class ModelManager(private val context: Context) {
+             val actualLength = file.length()
+             val cachedExpected = headContentLengths[desc.relativePath] ?: cachedContentLengths[desc.relativePath]
+ 
+-            val isValid = if (cachedExpected != null && cachedExpected > 0) {
+-                actualLength == cachedExpected
+-            } else {
+-                // If exact HEAD size is not yet cached, tolerate minor manifest deviations <= 2%
+-                val diff = Math.abs(actualLength - desc.expectedSizeBytes)
+-                val tolerance = (desc.expectedSizeBytes * 0.02).toLong()
+-                diff <= tolerance
++            // Neither a HEAD size nor the manifest length is byte-exact in practice: CDN re-packs and
++            // LFS rewrites shift the size a little. Anything within 2% is accepted; beyond that the
++            // file is considered broken. A stale cached HEAD size must never make a valid model
++            // permanently "corrupted" (and must never force a re-download or break offline mode).
++            val expected = cachedExpected ?: desc.expectedSizeBytes
++            val tolerance = (expected * 0.02).toLong()
++            val diff = Math.abs(actualLength - expected)
++
++            val manifestTolerance = (desc.expectedSizeBytes * 0.02).toLong()
++            val matchesManifest = Math.abs(actualLength - desc.expectedSizeBytes) <= manifestTolerance
++
++            val isValid = when {
++                diff <= tolerance -> true
++                // Cached HEAD size disagrees, but the file still matches the manifest: forget the
++                // cached value so the next HEAD fetch (or the next launch) can correct it.
++                cachedExpected != null && matchesManifest -> {
++                    headContentLengths.remove(desc.relativePath)
++                    cachedContentLengths.remove(desc.relativePath)
++                    prefs.edit().remove("size_rev1:${desc.relativePath}").apply()
++                    Log.w(tag, "Cached size for ${desc.relativePath} looks stale, falling back to manifest")
++                    true
++                }
++                else -> false
+             }
+ 
+             // Obvious corruption: <90% or >110% of manifest
+diff --git a/app/src/main/java/com/example/supertonic/playback/MediaCodecExporter.kt b/app/src/main/java/com/example/supertonic/playback/MediaCodecExporter.kt
+index b902975..133878e 100644
+--- a/app/src/main/java/com/example/supertonic/playback/MediaCodecExporter.kt
++++ b/app/src/main/java/com/example/supertonic/playback/MediaCodecExporter.kt
+@@ -7,102 +7,135 @@ import android.media.MediaMuxer
+ import android.util.Log
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.withContext
+-import java.io.ByteArrayInputStream
+ import java.io.File
+-import java.io.InputStream
+-import java.io.SequenceInputStream
++import java.io.FileOutputStream
++import java.io.RandomAccessFile
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
+-import java.util.Collections
+-import java.util.Vector
++import kotlin.math.min
+ 
++/**
++ * Streaming encoders that write PCM chunk by chunk straight into the destination file.
++ *
++ * The previous implementation required `List<ByteArray>` with the whole audiobook in RAM
++ * (≈ 317 MB per hour of 44.1 kHz mono PCM); a 3-hour book needed ~1 GB and could not be exported.
++ * With these writers the peak RAM is one synthesized chunk plus the codec buffers, and no
++ * intermediate spool file is ever created on disk.
++ */
+ object MediaCodecExporter {
+     private const val TAG = "MediaCodecExporter"
+ 
+-    /**
+-     * Encodes linear 16-bit PCM in RAM directly to AAC in an MPEG-4 container (.m4a)
+-     * without any intermediate PCM spool or cache files on disk.
+-     */
+-    suspend fun encodePcmChunksToM4a(
+-        pcmChunks: List<ByteArray>,
+-        destinationFile: File,
+-        sampleRate: Int = 44100,
+-        bitRate: Int = 128000,
+-        onProgress: (Float) -> Unit = {}
+-    ): Boolean = withContext(Dispatchers.IO) {
+-        val totalPcmBytes = pcmChunks.sumOf { it.size.toLong() }
+-        if (totalPcmBytes == 0L) {
+-            Log.e(TAG, "PCM chunks empty")
+-            return@withContext false
+-        }
++    interface AudioFileWriter {
++        /** Appends [length] bytes of 16-bit little-endian PCM. */
++        fun write(pcm: ByteArray, length: Int): Boolean
+ 
+-        var codec: MediaCodec? = null
+-        var muxer: MediaMuxer? = null
+-        var trackIndex = -1
+-        var muxerStarted = false
++        /** Flushes the encoder and finalizes the container. */
++        fun finish(): Boolean
+ 
+-        destinationFile.parentFile?.mkdirs()
+-        if (destinationFile.exists()) {
+-            destinationFile.delete()
+-        }
++        /** Releases resources and deletes the partially written file. */
++        fun abort()
++    }
+ 
+-        try {
+-            val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
+-                setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+-                setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
+-                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+-            }
++    // ------------------------------------------------------------------ AAC in MP4 (.m4a)
+ 
+-            codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+-            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+-            codec.start()
++    private class M4aWriter(
++        private val destinationFile: File,
++        private val sampleRate: Int,
++        private val bitRate: Int
++    ) : AudioFileWriter {
++        private val bytesPerSecond = sampleRate.toLong() * 2L
+ 
+-            muxer = MediaMuxer(destinationFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
++        private var codec: MediaCodec? = null
++        private var muxer: MediaMuxer? = null
++        private var trackIndex = -1
++        private var muxerStarted = false
++        private var presentationTimeUs = 0L
++        private var released = false
+ 
+-            val bufferInfo = MediaCodec.BufferInfo()
+-            val chunkStreams = Vector(pcmChunks.map { ByteArrayInputStream(it) })
+-            val combinedInputStream: InputStream = SequenceInputStream(chunkStreams.elements())
+-
+-            val chunkBuffer = ByteArray(4096)
+-            var bytesReadTotal = 0L
+-            var isInputEos = false
+-            var isOutputEos = false
+-            var presentationTimeUs = 0L
+-
+-            combinedInputStream.use { stream ->
+-                while (!isOutputEos) {
+-                    if (!isInputEos) {
+-                        val inputBufIndex = codec.dequeueInputBuffer(10000)
+-                        if (inputBufIndex >= 0) {
+-                            val inputBuf = codec.getInputBuffer(inputBufIndex) ?: continue
+-                            inputBuf.clear()
+-
+-                            val read = stream.read(chunkBuffer)
+-                            if (read <= 0) {
+-                                codec.queueInputBuffer(inputBufIndex, 0, 0, presentationTimeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+-                                isInputEos = true
+-                            } else {
+-                                inputBuf.put(chunkBuffer, 0, read)
+-                                val durationUs = (read.toLong() * 1_000_000L) / (sampleRate * 2L)
+-                                codec.queueInputBuffer(inputBufIndex, 0, read, presentationTimeUs, 0)
+-                                presentationTimeUs += durationUs
+-                                bytesReadTotal += read
+-                                onProgress((bytesReadTotal.toFloat() / totalPcmBytes.toFloat()).coerceIn(0f, 0.95f))
+-                            }
++        init {
++            destinationFile.parentFile?.mkdirs()
++            if (destinationFile.exists()) destinationFile.delete()
++
++            var created: MediaCodec? = null
++            try {
++                val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
++                    setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
++                    setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
++                    setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
++                }
++
++                val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
++                created = encoder
++                encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
++                encoder.start()
++                codec = encoder
++
++                muxer = MediaMuxer(destinationFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
++            } catch (e: Exception) {
++                // Never leak a native encoder if the container cannot be opened.
++                try {
++                    created?.stop()
++                } catch (ignored: Exception) {
++                }
++                try {
++                    created?.release()
++                } catch (ignored: Exception) {
++                }
++                codec = null
++                Log.e(TAG, "Cannot initialise AAC writer", e)
++                throw e
++            }
++        }
++
++        override fun write(pcm: ByteArray, length: Int): Boolean {
++            val enc = codec ?: return false
++            if (length <= 0) return true
++            return try {
++                var offset = 0
++                while (offset < length) {
++                    val inputIndex = enc.dequeueInputBuffer(10_000L)
++                    if (inputIndex >= 0) {
++                        val inputBuffer = enc.getInputBuffer(inputIndex) ?: continue
++                        inputBuffer.clear()
++                        val room = inputBuffer.remaining()
++                        val toCopy = min(room, length - offset)
++                        if (toCopy <= 0) {
++                            drain(endOfStream = false)
++                            continue
+                         }
++                        inputBuffer.put(pcm, offset, toCopy)
++                        enc.queueInputBuffer(inputIndex, 0, toCopy, presentationTimeUs, 0)
++                        presentationTimeUs += (toCopy.toLong() * 1_000_000L) / bytesPerSecond
++                        offset += toCopy
+                     }
++                    drain(endOfStream = false)
++                }
++                true
++            } catch (e: Exception) {
++                Log.e(TAG, "AAC streaming write failed", e)
++                false
++            }
++        }
+ 
+-                    val outputBufIndex = codec.dequeueOutputBuffer(bufferInfo, 10000)
+-                    if (outputBufIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
++        private fun drain(endOfStream: Boolean) {
++            val enc = codec ?: return
++            val mux = muxer ?: return
++            val bufferInfo = MediaCodec.BufferInfo()
++
++            while (true) {
++                val outputIndex = enc.dequeueOutputBuffer(bufferInfo, if (endOfStream) 10_000L else 0L)
++                when {
++                    outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> return
++                    outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                         if (muxerStarted) {
+                             throw IllegalStateException("Format changed twice in MediaCodec")
+                         }
+-                        val newFormat = codec.outputFormat
+-                        trackIndex = muxer.addTrack(newFormat)
+-                        muxer.start()
++                        trackIndex = mux.addTrack(enc.outputFormat)
++                        mux.start()
+                         muxerStarted = true
+-                    } else if (outputBufIndex >= 0) {
+-                        val encodedData = codec.getOutputBuffer(outputBufIndex)
++                    }
++                    outputIndex >= 0 -> {
++                        val encodedData = enc.getOutputBuffer(outputIndex)
+                         if (encodedData != null) {
+                             if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                                 bufferInfo.size = 0
+@@ -110,97 +143,250 @@ object MediaCodecExporter {
+                             if (bufferInfo.size != 0 && muxerStarted) {
+                                 encodedData.position(bufferInfo.offset)
+                                 encodedData.limit(bufferInfo.offset + bufferInfo.size)
+-                                muxer.writeSampleData(trackIndex, encodedData, bufferInfo)
++                                mux.writeSampleData(trackIndex, encodedData, bufferInfo)
+                             }
+                         }
+-
+-                        codec.releaseOutputBuffer(outputBufIndex, false)
+-
+-                        if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+-                            isOutputEos = true
+-                        }
++                        val isEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
++                        enc.releaseOutputBuffer(outputIndex, false)
++                        if (isEos) return
+                     }
++                    else -> return
+                 }
+             }
++        }
+ 
+-            codec.stop()
+-            codec.release()
+-            codec = null
++        override fun finish(): Boolean {
++            val enc = codec ?: return false
++            val mux = muxer ?: return false
++            return try {
++                val inputIndex = enc.dequeueInputBuffer(10_000L)
++                if (inputIndex >= 0) {
++                    enc.queueInputBuffer(
++                        inputIndex,
++                        0,
++                        0,
++                        presentationTimeUs,
++                        MediaCodec.BUFFER_FLAG_END_OF_STREAM
++                    )
++                }
++                drain(endOfStream = true)
+ 
+-            if (muxerStarted) {
+-                muxer.stop()
+-            }
+-            muxer.release()
+-            muxer = null
++                enc.stop()
++                enc.release()
++                this.codec = null
+ 
+-            onProgress(1.0f)
+-            return@withContext true
++                if (muxerStarted) mux.stop()
++                mux.release()
++                this.muxer = null
++                released = true
++                presentationTimeUs > 0L
++            } catch (e: Exception) {
++                Log.e(TAG, "AAC finalize failed", e)
++                abort()
++                false
++            }
++        }
+ 
+-        } catch (e: Exception) {
+-            Log.e(TAG, "AAC export failed", e)
+-            destinationFile.delete()
+-            return@withContext false
+-        } finally {
++        override fun abort() {
++            if (released) return
++            released = true
++            try {
++                codec?.stop()
++            } catch (ignored: Exception) {
++            }
+             try {
+                 codec?.release()
+-            } catch (ignored: Exception) {}
++            } catch (ignored: Exception) {
++            }
++            codec = null
+             try {
+                 muxer?.release()
+-            } catch (ignored: Exception) {}
++            } catch (ignored: Exception) {
++            }
++            muxer = null
++            if (destinationFile.exists()) destinationFile.delete()
+         }
+     }
+ 
+-    /**
+-     * Converts in-memory PCM chunks to a standard 16-bit PCM RIFF WAV file with a 44-byte header.
+-     * Writes only to the destinationFile without any temporary spool or intermediate files.
+-     */
+-    suspend fun convertPcmChunksToWav(
+-        pcmChunks: List<ByteArray>,
+-        destinationFile: File,
+-        sampleRate: Int = 44100
+-    ): Boolean = withContext(Dispatchers.IO) {
+-        val totalDataLen = pcmChunks.sumOf { it.size.toLong() }
+-        if (totalDataLen == 0L) return@withContext false
++    // ------------------------------------------------------------------ RIFF WAV
+ 
+-        destinationFile.parentFile?.mkdirs()
+-        try {
+-            val totalChunkLen = totalDataLen + 36
++    private class WavWriter(
++        private val destinationFile: File,
++        private val sampleRate: Int
++    ) : AudioFileWriter {
++        private var stream: FileOutputStream? = null
++        private var dataBytes = 0L
++        private var released = false
+ 
++        init {
++            destinationFile.parentFile?.mkdirs()
++            if (destinationFile.exists()) destinationFile.delete()
++            val out = FileOutputStream(destinationFile)
++            out.write(ByteArray(44)) // placeholder, rewritten in finish()
++            stream = out
++        }
++
++        override fun write(pcm: ByteArray, length: Int): Boolean {
++            val out = stream ?: return false
++            if (length <= 0) return true
++            return try {
++                out.write(pcm, 0, length)
++                dataBytes += length
++                true
++            } catch (e: Exception) {
++                Log.e(TAG, "WAV streaming write failed", e)
++                false
++            }
++        }
++
++        override fun finish(): Boolean {
++            val out = stream ?: return false
++            return try {
++                out.flush()
++                out.close()
++                stream = null
++
++                if (dataBytes == 0L) {
++                    destinationFile.delete()
++                    released = true
++                    return false
++                }
++
++                val header = buildHeader(dataBytes)
++                RandomAccessFile(destinationFile, "rw").use { raf ->
++                    raf.seek(0)
++                    raf.write(header)
++                }
++                released = true
++                true
++            } catch (e: Exception) {
++                Log.e(TAG, "WAV finalize failed", e)
++                abort()
++                false
++            }
++        }
++
++        private fun buildHeader(totalDataLen: Long): ByteArray {
+             val header = ByteArray(44)
+             val buf = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
+-
+-            // RIFF header
+             buf.put("RIFF".toByteArray(Charsets.US_ASCII))
+-            buf.putInt(totalChunkLen.toInt())
++            buf.putInt((totalDataLen + 36).toInt())
+             buf.put("WAVE".toByteArray(Charsets.US_ASCII))
+-
+-            // 'fmt ' chunk
+             buf.put("fmt ".toByteArray(Charsets.US_ASCII))
+-            buf.putInt(16) // Subchunk1Size
+-            buf.putShort(1.toShort()) // AudioFormat (1 = PCM)
+-            buf.putShort(1.toShort()) // NumChannels (1 = Mono)
++            buf.putInt(16)
++            buf.putShort(1.toShort()) // PCM
++            buf.putShort(1.toShort()) // mono
+             buf.putInt(sampleRate)
+-            buf.putInt(sampleRate * 2) // ByteRate (SampleRate * NumChannels * BitsPerSample/8)
+-            buf.putShort(2.toShort()) // BlockAlign (NumChannels * BitsPerSample/8)
+-            buf.putShort(16.toShort()) // BitsPerSample
+-
+-            // 'data' chunk
++            buf.putInt(sampleRate * 2)
++            buf.putShort(2.toShort()) // block align
++            buf.putShort(16.toShort()) // bits per sample
+             buf.put("data".toByteArray(Charsets.US_ASCII))
+             buf.putInt(totalDataLen.toInt())
++            return header
++        }
+ 
+-            destinationFile.outputStream().use { os ->
+-                os.write(header)
+-                for (chunk in pcmChunks) {
+-                    os.write(chunk)
++        override fun abort() {
++            if (released) return
++            released = true
++            try {
++                stream?.close()
++            } catch (ignored: Exception) {
++            }
++            stream = null
++            if (destinationFile.exists()) destinationFile.delete()
++        }
++    }
++
++    /** Opens a streaming AAC/MP4 writer, or null if the encoder cannot be created. */
++    fun openM4aWriter(
++        destinationFile: File,
++        sampleRate: Int = 44100,
++        bitRate: Int = 128000
++    ): AudioFileWriter? {
++        return try {
++            M4aWriter(destinationFile, sampleRate, bitRate)
++        } catch (e: Exception) {
++            Log.e(TAG, "Cannot open AAC writer", e)
++            if (destinationFile.exists()) destinationFile.delete()
++            null
++        }
++    }
++
++    /** Opens a streaming WAV writer, or null if the file cannot be created. */
++    fun openWavWriter(destinationFile: File, sampleRate: Int = 44100): AudioFileWriter? {
++        return try {
++            WavWriter(destinationFile, sampleRate)
++        } catch (e: Exception) {
++            Log.e(TAG, "Cannot open WAV writer", e)
++            if (destinationFile.exists()) destinationFile.delete()
++            null
++        }
++    }
++
++    // ------------------------------------------------------------------ legacy list helpers
++
++    /**
++     * Encodes linear 16-bit PCM in RAM directly to AAC in an MPEG-4 container (.m4a).
++     * Kept for callers that already hold all PCM; the export path uses [openM4aWriter].
++     */
++    suspend fun encodePcmChunksToM4a(
++        pcmChunks: List<ByteArray>,
++        destinationFile: File,
++        sampleRate: Int = 44100,
++        bitRate: Int = 128000,
++        onProgress: (Float) -> Unit = {}
++    ): Boolean = withContext(Dispatchers.IO) {
++        val totalPcmBytes = pcmChunks.sumOf { it.size.toLong() }
++        if (totalPcmBytes == 0L) {
++            Log.e(TAG, "PCM chunks empty")
++            return@withContext false
++        }
++
++        val writer = openM4aWriter(destinationFile, sampleRate, bitRate) ?: return@withContext false
++        var written = 0L
++        try {
++            for (chunk in pcmChunks) {
++                if (!writer.write(chunk, chunk.size)) {
++                    writer.abort()
++                    return@withContext false
+                 }
+-                os.flush()
++                written += chunk.size
++                onProgress((written.toFloat() / totalPcmBytes.toFloat()).coerceIn(0f, 0.95f))
+             }
++            val ok = writer.finish()
++            if (ok) onProgress(1.0f)
++            ok
++        } catch (e: Exception) {
++            Log.e(TAG, "AAC export failed", e)
++            writer.abort()
++            false
++        }
++    }
++
++    /**
++     * Converts in-memory PCM chunks to a standard 16-bit PCM RIFF WAV file with a 44-byte header.
++     * Writes only to the destinationFile without any temporary spool or intermediate files.
++     */
++    suspend fun convertPcmChunksToWav(
++        pcmChunks: List<ByteArray>,
++        destinationFile: File,
++        sampleRate: Int = 44100
++    ): Boolean = withContext(Dispatchers.IO) {
++        if (pcmChunks.all { it.isEmpty() }) return@withContext false
+ 
+-            return@withContext true
++        val writer = openWavWriter(destinationFile, sampleRate) ?: return@withContext false
++        try {
++            for (chunk in pcmChunks) {
++                if (!writer.write(chunk, chunk.size)) {
++                    writer.abort()
++                    return@withContext false
++                }
++            }
++            writer.finish()
+         } catch (e: Exception) {
+             Log.e(TAG, "WAV export error", e)
+-            destinationFile.delete()
+-            return@withContext false
++            writer.abort()
++            false
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/example/supertonic/playback/PcmChunk.kt b/app/src/main/java/com/example/supertonic/playback/PcmChunk.kt
+deleted file mode 100644
+index 2d6d8b1..0000000
+--- a/app/src/main/java/com/example/supertonic/playback/PcmChunk.kt
++++ /dev/null
+@@ -1,25 +0,0 @@
+-package com.example.supertonic.playback
+-
+-data class PcmChunk(
+-    val index: Int,
+-    val pcmBytes: ByteArray,
+-    val durationSec: Float,
+-    val text: String,
+-    val startOffset: Int,
+-    val endOffset: Int,
+-    val sampleRate: Int = 44100
+-) {
+-    override fun equals(other: Any?): Boolean {
+-        if (this === other) return true
+-        if (javaClass != other?.javaClass) return false
+-        other as PcmChunk
+-        return index == other.index && startOffset == other.startOffset && endOffset == other.endOffset
+-    }
+-
+-    override fun hashCode(): Int {
+-        var result = index
+-        result = 31 * result + startOffset
+-        result = 31 * result + endOffset
+-        return result
+-    }
+-}
+diff --git a/app/src/main/java/com/example/supertonic/playback/SupertonicPlaybackService.kt b/app/src/main/java/com/example/supertonic/playback/SupertonicPlaybackService.kt
+index 75a4c74..eb8e63d 100644
+--- a/app/src/main/java/com/example/supertonic/playback/SupertonicPlaybackService.kt
++++ b/app/src/main/java/com/example/supertonic/playback/SupertonicPlaybackService.kt
+@@ -16,6 +16,7 @@ import android.os.Binder
+ import android.os.Build
+ import android.os.IBinder
+ import android.os.PowerManager
++import android.os.SystemClock
+ import android.support.v4.media.session.MediaSessionCompat
+ import android.support.v4.media.session.PlaybackStateCompat
+ import android.util.Log
+@@ -89,6 +90,9 @@ class SupertonicPlaybackService : Service() {
+         const val EXTRA_LANG = "extra_lang"
+         const val EXTRA_VOICE = "extra_voice"
+         const val EXTRA_SHOW_OVERLAY = "extra_show_overlay"
++
++        /** How often the playback position (timeline / MediaSession) is published, in ms. */
++        private const val UI_TICK_MS = 250L
+     }
+ 
+     private val binder = LocalBinder()
+@@ -107,7 +111,6 @@ class SupertonicPlaybackService : Service() {
+     private var mediaSession: MediaSessionCompat? = null
+     private var currentFocusRequest: AudioFocusRequest? = null
+ 
+-    val engine: SpeechEngine get() = EngineHost.rawEngine
+     lateinit var modelManager: ModelManager
+         private set
+     lateinit var cpuAffinity: CpuAffinityManager
+@@ -128,6 +131,20 @@ class SupertonicPlaybackService : Service() {
+     private val generationId = AtomicInteger(0)
+     private var activeChunks: List<TextChunk> = emptyList()
+ 
++    // Position bookkeeping inside the current chunk: needed so that pause/resume continues at the
++    // exact frame instead of replaying the whole phrase, and so that a seek can hand the sink a
++    // byte offset. All absolute positions still live in PlaybackClock.
++    @Volatile private var currentPlaybackChunk: Int = -1
++    @Volatile private var currentChunkWriteOffset: Int = 0
++    @Volatile private var pausedChunkIndex: Int = -1
++    @Volatile private var pausedChunkByteOffset: Int = 0
++
++    /** True when the clock base refers to the current timeline (set on play/seek, cleared on stop). */
++    @Volatile private var timelineAnchored: Boolean = false
++
++    /** Reused chunk buffer: the playback loop no longer allocates a ByteArray per chunk. */
++    private var pcmScratch: ByteArray = ByteArray(0)
++
+     @Volatile
+     private var activeVoiceId: String = "F1"
+     @Volatile
+@@ -169,7 +186,15 @@ class SupertonicPlaybackService : Service() {
+ 
+         scheduler = SynthesisScheduler(pcmRing, serviceScope).apply {
+             onChunkSynthesized = { chunkIndex, durationSec, rtf ->
++                // Exact durations move every later span. Without shifting the clock base by the same
++                // delta the displayed position (and progress) would drift while chunks are refined.
++                val anchor = _playbackState.value.currentChunkIndex
++                val anchorBefore = sourceIndex?.sampleStartOf(anchor) ?: 0L
+                 sourceIndex?.updateSynthesizedChunk(chunkIndex, durationSec)
++                val anchorAfter = sourceIndex?.sampleStartOf(anchor) ?: 0L
++                if (timelineAnchored && anchorAfter != anchorBefore) {
++                    clock.shiftBaseBy(anchorAfter - anchorBefore)
++                }
+                 val total = activeChunks.size
+                 val synthList = List(total) { idx -> pcmRing.isReady(idx) }
+                 val curSec = clock.currentSeconds
+@@ -240,6 +265,8 @@ class SupertonicPlaybackService : Service() {
+         steps: Int = 3,
+         speed: Float = 1.0f,
+         startIndex: Int = 0,
++        // Start at the chunk that contains this paragraph (-1 = ignore).
++        startParagraphIndex: Int = -1,
+         showOverlay: Boolean = false,
+         paragraphs: List<ParagraphItem> = emptyList()
+     ) {
+@@ -250,6 +277,12 @@ class SupertonicPlaybackService : Service() {
+         sink.stop()
+         pcmRing.clear()
+ 
++        currentPlaybackChunk = -1
++        currentChunkWriteOffset = 0
++        pausedChunkIndex = -1
++        pausedChunkByteOffset = 0
++        timelineAnchored = false
++
+         activeLang = lang
+         activeVoiceId = voiceId
+         activeSteps = steps
+@@ -331,25 +364,39 @@ class SupertonicPlaybackService : Service() {
+                     overlayManager.show()
+                 }
+ 
+-                val initialChunk = chunks.getOrElse(startIndex) { chunks.first() }
+-                val span = index.getSpan(initialChunk.index)
++                // Paragraph tap: resolve the chunk only now, when segmentation and the index exist.
++                val requestedChunk = if (startParagraphIndex >= 0) {
++                    index.findChunkIndexByParagraph(startParagraphIndex)
++                } else {
++                    startIndex
++                }
++                val initialIndex = requestedChunk.coerceIn(0, chunks.lastIndex)
++                val initialChunk = chunks[initialIndex]
++                val span = index.getSpan(initialIndex)
++                val startSample = index.sampleStartOf(initialIndex)
++
++                clock.resetToSample(startSample)
++                timelineAnchored = true
++                pausedChunkIndex = -1
++                pausedChunkByteOffset = 0
++                currentChunkWriteOffset = 0
+ 
+                 _playbackState.value = PlaybackState(
+                     status = PlaybackStatus.BUFFERING,
+-                    currentChunkIndex = initialChunk.index,
++                    currentChunkIndex = initialIndex,
+                     totalChunks = chunks.size,
+                     currentParagraphIndex = span?.paragraphIndex ?: 0,
+                     currentSentenceText = initialChunk.text,
+                     currentSentenceStart = initialChunk.startOffset,
+                     currentSentenceEnd = initialChunk.endOffset,
+-                    timelineDisplay = index.formatTimeline(0f),
++                    timelineDisplay = index.formatTimeline(startSample.toFloat() / 44100f),
+                     totalEstimatedSeconds = index.getTotalEstimatedDurationSeconds(),
+                     playbackSpeed = speed,
+                     isChunkSynthesized = List(chunks.size) { false }
+                 )
+ 
+-                scheduler.scheduleAround(startIndex)
+-                startPlaybackLoop(currentGen, startIndex)
++                scheduler.scheduleAround(initialIndex)
++                startPlaybackLoop(currentGen, initialIndex)
+             }
+         }
+     }
+@@ -366,7 +413,16 @@ class SupertonicPlaybackService : Service() {
+         }
+         val currentGen = generationId.incrementAndGet()
+         playbackJob?.cancel()
+-        sink.flush()
++
++        val span = sourceIndex?.getSpan(currentChunk)
++        if (span != null) {
++            clock.resetToSample(span.sampleStart)
++        } else {
++            sink.flush()
++        }
++        currentChunkWriteOffset = 0
++        pausedChunkIndex = -1
++        pausedChunkByteOffset = 0
+ 
+         _playbackState.value = _playbackState.value.copy(
+             status = PlaybackStatus.BUFFERING,
+@@ -399,10 +455,18 @@ class SupertonicPlaybackService : Service() {
+ 
+         val currentGen = generationId.incrementAndGet()
+         playbackJob?.cancel()
+-        sink.flush()
+ 
++        // resetToSample() flushes the sink itself: a second manual flush reset the counters twice.
+         val span = sourceIndex?.getSpan(clampedIndex)
+-        span?.let { clock.resetToSample(it.sampleStart) }
++        if (span != null) {
++            clock.resetToSample(span.sampleStart)
++        } else {
++            sink.flush()
++        }
++        timelineAnchored = true
++        currentChunkWriteOffset = 0
++        pausedChunkIndex = -1
++        pausedChunkByteOffset = 0
+ 
+         val isReady = pcmRing.isReady(clampedIndex)
+         _playbackState.value = _playbackState.value.copy(
+@@ -419,33 +483,43 @@ class SupertonicPlaybackService : Service() {
+         startPlaybackLoop(currentGen, clampedIndex)
+     }
+ 
+-    private fun startPlaybackLoop(currentGen: Int, startIndex: Int) {
++    private fun startPlaybackLoop(currentGen: Int, startIndex: Int, startByteOffset: Int = 0) {
+         playbackJob?.cancel()
+         playbackJob = serviceScope.launch(Dispatchers.IO) {
+             try {
+                 sink.play()
+                 var currentIndex = startIndex
++                var nextChunkByteOffset = startByteOffset.coerceAtLeast(0)
+ 
+                 while (currentIndex < activeChunks.size && generationId.get() == currentGen) {
+-                    var chunkPcm = pcmRing.getChunk(currentIndex)
+-                    while (chunkPcm == null && generationId.get() == currentGen) {
+-                        if (_playbackState.value.status == PlaybackStatus.ERROR) {
+-                            return@launch
+-                        }
++                    // Wait for the scheduler; the PCM is copied into a reused buffer (no allocation
++                    // per chunk, which used to churn the heap on every phrase).
++                    var chunkSize = -1
++                    while (generationId.get() == currentGen) {
++                        if (_playbackState.value.status == PlaybackStatus.ERROR) return@launch
++                        chunkSize = pcmRing.sizeOf(currentIndex) ?: -1
++                        if (chunkSize > 0) break
+                         withContext(Dispatchers.Main) {
+                             if (_playbackState.value.status != PlaybackStatus.ERROR) {
+                                 _playbackState.value = _playbackState.value.copy(status = PlaybackStatus.BUFFERING)
+                             }
+                         }
+                         delay(40)
+-                        chunkPcm = pcmRing.getChunk(currentIndex)
+                     }
+ 
+-                    if (chunkPcm == null || generationId.get() != currentGen) break
++                    if (chunkSize <= 0 || generationId.get() != currentGen) break
++
++                    val chunkPcm = scratchBuffer(chunkSize)
++                    if (pcmRing.copyChunkInto(currentIndex, chunkPcm, 0) != chunkSize) {
++                        delay(20)
++                        continue
++                    }
+ 
+                     val chunk = activeChunks[currentIndex]
+                     val span = sourceIndex?.getSpan(currentIndex)
+ 
++                    currentPlaybackChunk = currentIndex
++
+                     withContext(Dispatchers.Main) {
+                         pcmRing.advance(currentIndex, activeChunks)
+                         scheduler.scheduleAround(currentIndex)
+@@ -469,18 +543,34 @@ class SupertonicPlaybackService : Service() {
+                             underruns = sink.getUnderruns()
+                         )
+                         updateNotificationThrottled(chunk.text, true)
++                        updateMediaSession(isPlaying = true)
++                    }
++
++                    // Resume from an exact byte offset after pause; start from the chunk head otherwise.
++                    var writeOffset = if (currentIndex == startIndex) {
++                        nextChunkByteOffset.coerceIn(0, chunkSize)
++                    } else {
++                        0
+                     }
++                    nextChunkByteOffset = 0
++                    currentChunkWriteOffset = writeOffset
+ 
+-                    // Write audio chunk in <= 100 ms slices
+-                    var writeOffset = 0
+-                    while (writeOffset < chunkPcm.size && generationId.get() == currentGen) {
+-                        val remaining = chunkPcm.size - writeOffset
+-                        val written = sink.writeSlice(chunkPcm, writeOffset, remaining)
++                    // Write audio in <= 100 ms slices, publishing the live position every UI_TICK_MS.
++                    var lastTick = SystemClock.elapsedRealtime()
++                    while (writeOffset < chunkSize && generationId.get() == currentGen) {
++                        val written = sink.writeSlice(chunkPcm, writeOffset, chunkSize - writeOffset)
+                         if (written > 0) {
+                             writeOffset += written
++                            currentChunkWriteOffset = writeOffset
+                         } else {
+                             delay(20)
+                         }
++
++                        val now = SystemClock.elapsedRealtime()
++                        if (now - lastTick >= UI_TICK_MS) {
++                            lastTick = now
++                            publishPosition()
++                        }
+                     }
+ 
+                     currentIndex++
+@@ -511,6 +601,30 @@ class SupertonicPlaybackService : Service() {
+         }
+     }
+ 
++    /** Grows (never shrinks) the reused PCM buffer to the requested chunk size. */
++    private fun scratchBuffer(size: Int): ByteArray {
++        if (pcmScratch.size < size) {
++            pcmScratch = ByteArray(size)
++        }
++        return pcmScratch
++    }
++
++    /** Publishes the live position: timeline, progress, buffered audio and MediaSession. */
++    private suspend fun publishPosition() {
++        withContext(Dispatchers.Main) {
++            val curSec = clock.currentSeconds
++            val totalSec = sourceIndex?.getTotalEstimatedDurationSeconds() ?: 1f
++            _playbackState.value = _playbackState.value.copy(
++                currentSeconds = curSec,
++                playbackProgress = if (totalSec > 0f) (curSec / totalSec).coerceIn(0f, 1f) else 0f,
++                timelineDisplay = sourceIndex?.formatTimeline(curSec) ?: "00:00 / 00:00",
++                bufferedSeconds = sink.getBufferedDurationSeconds(),
++                underruns = sink.getUnderruns()
++            )
++            updateMediaSession(isPlaying = _playbackState.value.status == PlaybackStatus.PLAYING)
++        }
++    }
++
+     fun startIndependentBatchExport(
+         text: String,
+         lang: String,
+@@ -530,21 +644,6 @@ class SupertonicPlaybackService : Service() {
+                     return@launch
+                 }
+ 
+-                // RAM safety check before batch export (> 400 MB)
+-                val totalChars = chunks.sumOf { it.text.length }
+-                val estimatedSec = totalChars / 12.0
+-                val estimatedPcmBytes = (estimatedSec * 44100 * 2).toLong()
+-                if (estimatedPcmBytes > 400L * 1024 * 1024) {
+-                    val estMin = (estimatedSec / 60.0).toInt()
+-                    withContext(Dispatchers.Main) {
+-                        onComplete(
+-                            false,
+-                            "Размер аудио (~$estMin мин) превышает лимит RAM (400 МБ). Пожалуйста, экспортируйте текст по главам."
+-                        )
+-                    }
+-                    return@launch
+-                }
+-
+                 if (!EngineHost.isLoaded.value) {
+                     val threads = cpuAffinity.getActiveThreadCount()
+                     EngineHost.load(modelManager.modelDir, numThreads = threads)
+@@ -556,45 +655,60 @@ class SupertonicPlaybackService : Service() {
+                     return@launch
+                 }
+ 
+-                val pcmChunks = mutableListOf<ByteArray>()
++                // Streaming export: each synthesized chunk is encoded and written immediately, so the
++                // whole book never sits in RAM (the old List<ByteArray> needed ≈1 GB for 3 hours and
++                // had to refuse long exports). No temporary spool files are created either.
++                val writer = if (format == "m4a") {
++                    MediaCodecExporter.openM4aWriter(targetFile)
++                } else {
++                    MediaCodecExporter.openWavWriter(targetFile)
++                }
++                if (writer == null) {
++                    withContext(Dispatchers.Main) { onComplete(false, "Не удалось открыть аудиофайл") }
++                    return@launch
++                }
+ 
+-                for ((idx, chunk) in chunks.withIndex()) {
+-                    val synth = EngineHost.withEngine { eng: SpeechEngine ->
+-                        eng.synthesizeChunk(
+-                            rawText = chunk.text,
+-                            lang = chunk.resolvedLang,
+-                            voiceStyle = voice,
+-                            totalSteps = steps,
+-                            speed = 1.0f
+-                        )
+-                    }
+-                    if (synth == null) {
+-                        if (targetFile.exists()) targetFile.delete()
+-                        withContext(Dispatchers.Main) {
+-                            onComplete(false, "Ошибка синтеза чанка ${idx + 1}")
++                var chunksWritten = 0
++                var success = false
++                try {
++                    for ((idx, chunk) in chunks.withIndex()) {
++                        val synth = EngineHost.withEngine { eng: SpeechEngine ->
++                            eng.synthesizeChunk(
++                                rawText = chunk.text,
++                                lang = chunk.resolvedLang,
++                                voiceStyle = voice,
++                                totalSteps = steps,
++                                speed = 1.0f
++                            )
+                         }
+-                        return@launch
+-                    }
+-                    pcmChunks.add(synth.pcmBytes)
++                        if (synth == null) {
++                            withContext(Dispatchers.Main) {
++                                onComplete(false, "Ошибка синтеза чанка ${idx + 1}")
++                            }
++                            return@launch
++                        }
++                        if (!writer.write(synth.pcmBytes, synth.pcmBytes.size)) {
++                            withContext(Dispatchers.Main) {
++                                onComplete(false, "Ошибка записи аудио (чанк ${idx + 1})")
++                            }
++                            return@launch
++                        }
++                        chunksWritten++
+ 
+-                    val progress = ((idx + 1).toFloat() / chunks.size.toFloat()) * 0.85f
+-                    withContext(Dispatchers.Main) {
+-                        onProgress(progress)
++                        val progress = ((idx + 1).toFloat() / chunks.size.toFloat()) * 0.95f
++                        withContext(Dispatchers.Main) {
++                            onProgress(progress)
++                        }
+                     }
+-                }
+ 
+-                // Direct encode to targetFile without temporary files
+-                val success = if (format == "m4a") {
+-                    MediaCodecExporter.encodePcmChunksToM4a(pcmChunks, targetFile) { p ->
+-                        serviceScope.launch(Dispatchers.Main) {
+-                            onProgress(0.85f + (p * 0.15f))
+-                        }
++                    success = writer.finish()
++                } finally {
++                    if (!success) {
++                        writer.abort()
+                     }
+-                } else {
+-                    MediaCodecExporter.convertPcmChunksToWav(pcmChunks, targetFile)
+                 }
+ 
+-                if (!success && targetFile.exists()) {
++                if (!success && chunksWritten > 0 && targetFile.exists()) {
+                     targetFile.delete()
+                 }
+ 
+@@ -623,30 +737,74 @@ class SupertonicPlaybackService : Service() {
+     }
+ 
+     fun pause() {
++        // Stop the producer first. Cancelling the coroutine alone is not enough: a blocking
++        // AudioTrack.write() keeps running until it returns, and only the generation counter is
++        // checked between writes.
++        generationId.incrementAndGet()
+         playbackJob?.cancel()
+         sink.pause()
++
++        // No flush() here: keeping the buffered frames means resume neither repeats the phrase
++        // (the old behaviour re-wrote the chunk into a live buffer) nor drops its tail.
++        pausedChunkIndex = if (currentPlaybackChunk >= 0) {
++            currentPlaybackChunk
++        } else {
++            _playbackState.value.currentChunkIndex
++        }
++        pausedChunkByteOffset = currentChunkWriteOffset
++
+         releaseWakeLock()
+ 
+-        _playbackState.value = _playbackState.value.copy(status = PlaybackStatus.PAUSED)
++        _playbackState.value = _playbackState.value.copy(
++            status = PlaybackStatus.PAUSED,
++            currentSeconds = clock.currentSeconds
++        )
+         updateNotificationThrottled("Пауза", false, force = true)
++        updateMediaSession(isPlaying = false)
+     }
+ 
+     fun resume() {
+         if (_playbackState.value.status == PlaybackStatus.PAUSED) {
+             val currentGen = generationId.incrementAndGet()
+-            _playbackState.value = _playbackState.value.copy(status = PlaybackStatus.PLAYING)
++            val startIdx = if (pausedChunkIndex >= 0) {
++                pausedChunkIndex.coerceIn(0, (activeChunks.size - 1).coerceAtLeast(0))
++            } else {
++                _playbackState.value.currentChunkIndex
++            }
++            // The producer may have queued one more slice after the cancel request, so take the
++            // furthest of the two offsets; otherwise up to 100 ms of audio would be duplicated.
++            val startOffset = if (startIdx == pausedChunkIndex) {
++                maxOf(pausedChunkByteOffset, currentChunkWriteOffset)
++            } else {
++                0
++            }
++            pausedChunkIndex = -1
++            pausedChunkByteOffset = 0
++
++            _playbackState.value = _playbackState.value.copy(
++                status = PlaybackStatus.PLAYING,
++                currentChunkIndex = startIdx,
++                bufferedSeconds = 0f
++            )
+             acquireWakeLock()
+             updateNotificationThrottled(_playbackState.value.currentSentenceText, true, force = true)
+-            startPlaybackLoop(currentGen, _playbackState.value.currentChunkIndex)
++            startPlaybackLoop(currentGen, startIdx, startOffset)
+         }
+     }
+ 
+     fun stop() {
++        generationId.incrementAndGet()
+         prepJob?.cancel()
+         playbackJob?.cancel()
+         scheduler.cancelAll()
+         sink.stop()
++        clock.reset()
+         pcmRing.clear()
++        currentPlaybackChunk = -1
++        currentChunkWriteOffset = 0
++        pausedChunkIndex = -1
++        pausedChunkByteOffset = 0
++        timelineAnchored = false
+         releaseWakeLock()
+         abandonAudioFocus()
+ 
+@@ -667,9 +825,16 @@ class SupertonicPlaybackService : Service() {
+     }
+ 
+     fun jumpSeconds(deltaSec: Int) {
+-        val curSec = clock.currentSeconds
+-        val targetSec = maxOf(0f, curSec + deltaSec)
+-        val targetSample = (targetSec * 44100).toLong()
++        // Prefer the live clock; fall back to the published state when nothing is anchored yet.
++        val curSec = if (timelineAnchored) clock.currentSeconds else _playbackState.value.currentSeconds
++        seekToSeconds(curSec + deltaSec)
++    }
++
++    /** Seeks to an absolute timeline position in seconds (used by the UI and MediaSession). */
++    fun seekToSeconds(targetSeconds: Float) {
++        if (activeChunks.isEmpty()) return
++        val safeSeconds = targetSeconds.coerceAtLeast(0f)
++        val targetSample = (safeSeconds * 44100f).toLong()
+         val targetChunk = sourceIndex?.findChunkIndexBySample(targetSample) ?: 0
+         seekToChunk(targetChunk)
+     }
+@@ -732,13 +897,25 @@ class SupertonicPlaybackService : Service() {
+                 override fun onStop() = stop()
+                 override fun onSkipToNext() = skipNext()
+                 override fun onSkipToPrevious() = skipPrevious()
++
++                // Lock screen / headset / Android Auto scrubbing: two-way seek support.
++                override fun onSeekTo(pos: Long) = seekToSeconds(pos / 1000f)
++                override fun onFastForward() = jumpSeconds(15)
++                override fun onRewind() = jumpSeconds(-15)
+             })
+             isActive = true
+         }
+     }
+ 
+-    private fun updateMediaSession(isPlaying: Boolean, title: String) {
+-        val state = if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
++    private fun updateMediaSession(isPlaying: Boolean) {
++        val state = when {
++            isPlaying -> PlaybackStateCompat.STATE_PLAYING
++            _playbackState.value.status == PlaybackStatus.PAUSED -> PlaybackStateCompat.STATE_PAUSED
++            _playbackState.value.status == PlaybackStatus.BUFFERING -> PlaybackStateCompat.STATE_BUFFERING
++            _playbackState.value.status == PlaybackStatus.COMPLETED -> PlaybackStateCompat.STATE_STOPPED
++            else -> PlaybackStateCompat.STATE_PAUSED
++        }
++        val positionMs = (clock.currentSeconds * 1000f).toLong().coerceAtLeast(0L)
+         mediaSession?.setPlaybackState(
+             PlaybackStateCompat.Builder()
+                 .setActions(
+@@ -746,9 +923,12 @@ class SupertonicPlaybackService : Service() {
+                             PlaybackStateCompat.ACTION_PAUSE or
+                             PlaybackStateCompat.ACTION_STOP or
+                             PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+-                            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
++                            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
++                            PlaybackStateCompat.ACTION_SEEK_TO or
++                            PlaybackStateCompat.ACTION_FAST_FORWARD or
++                            PlaybackStateCompat.ACTION_REWIND
+                 )
+-                .setState(state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1.0f)
++                .setState(state, positionMs, _playbackState.value.playbackSpeed)
+                 .build()
+         )
+     }
+@@ -819,7 +999,7 @@ class SupertonicPlaybackService : Service() {
+             lastNotificationTime = now
+             val nm = getSystemService(NotificationManager::class.java)
+             nm.notify(NOTIFICATION_ID, buildNotification(text, isPlaying))
+-            updateMediaSession(isPlaying, text)
++            updateMediaSession(isPlaying)
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/example/supertonic/ui/MainViewModel.kt b/app/src/main/java/com/example/supertonic/ui/MainViewModel.kt
+index 1586e5f..84bbeff 100644
+--- a/app/src/main/java/com/example/supertonic/ui/MainViewModel.kt
++++ b/app/src/main/java/com/example/supertonic/ui/MainViewModel.kt
+@@ -317,17 +317,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
+         if (currentStatus == PlaybackStatus.IDLE || currentStatus == PlaybackStatus.COMPLETED || currentStatus == PlaybackStatus.ERROR) {
+             val langToUse = if (selectedLang.value == "auto") detectedLang.value else selectedLang.value
+             val showOverlay = overlayEnabled.value && Settings.canDrawOverlays(getApplication())
++            // The paragraph is resolved to a chunk inside playText(), after segmentation built a fresh
++            // index. Seeking right after playText() used the previous (or empty) index and therefore
++            // always restarted reading from the beginning of the chapter.
+             service.playText(
+                 text = currentChapterText.value,
+                 lang = langToUse,
+                 voiceId = selectedVoice.value,
+                 steps = synthesisSteps.value,
+                 speed = speechSpeed.value,
+-                startIndex = 0,
++                startParagraphIndex = paragraphIndex,
+                 showOverlay = showOverlay,
+                 paragraphs = currentParagraphs.value
+             )
+-            service.seekToParagraph(paragraphIndex)
+         } else {
+             service.seekToParagraph(paragraphIndex)
+         }
+@@ -357,6 +359,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
+         playbackService?.jumpSeconds(deltaSec)
+     }
+ 
++    /** Absolute seek used by the timeline slider and MediaSession scrubbing. */
++    fun seekToSeconds(seconds: Float) {
++        playbackService?.seekToSeconds(seconds)
++    }
++
+     fun onSpeedChanged(newSpeed: Float) {
+         speechSpeed.value = newSpeed
+         playbackService?.setPlaybackSpeed(newSpeed)
+diff --git a/app/src/test/java/com/example/SupertonicCoreTest.kt b/app/src/test/java/com/example/SupertonicCoreTest.kt
+index d3d5174..78a9db1 100644
+--- a/app/src/test/java/com/example/SupertonicCoreTest.kt
++++ b/app/src/test/java/com/example/SupertonicCoreTest.kt
+@@ -281,4 +281,80 @@ class SupertonicCoreTest {
+         val chunkForPara = sourceIndex.findChunkIndexByParagraph(0)
+         assertEquals(0, chunkForPara)
+     }
++    @Test
++    fun testSourceIndex_offsetsShiftWhenEarlierChunkGetsExactDuration() {
++        val chunks = listOf(
++            com.example.supertonic.language.TextChunk(0, "Первая.", 0, 7, "ru"),
++            com.example.supertonic.language.TextChunk(1, "Вторая.", 8, 15, "ru"),
++            com.example.supertonic.language.TextChunk(2, "Третья.", 16, 23, "ru")
++        )
++        val sourceIndex = com.example.supertonic.core.SourceIndex(chunks, emptyList(), sampleRate = 1000)
++
++        val secondBefore = sourceIndex.sampleStartOf(1)
++        val thirdBefore = sourceIndex.sampleStartOf(2)
++
++        // Exact duration shorter than the estimate must pull every later chunk back.
++        sourceIndex.updateSynthesizedChunk(0, 0.5f)
++
++        assertEquals(500L, sourceIndex.sampleStartOf(1))
++        assertEquals(500L - secondBefore + thirdBefore, sourceIndex.sampleStartOf(2))
++        assertTrue(sourceIndex.sampleStartOf(1) < secondBefore)
++        assertEquals(0.5f, sourceIndex.durationSecondsOf(0), 0.0001f)
++    }
++
++    @Test
++    fun testSourceIndex_sampleLookupIsMonotonic() {
++        val chunks = (0 until 4).map { idx ->
++            com.example.supertonic.language.TextChunk(idx, "Фраза номер $idx.", idx * 20, (idx + 1) * 20, "ru")
++        }
++        val sourceIndex = com.example.supertonic.core.SourceIndex(chunks, emptyList(), sampleRate = 1000)
++        for (idx in 0 until 4) {
++            sourceIndex.updateSynthesizedChunk(idx, 1.0f)
++        }
++
++        assertEquals(0, sourceIndex.findChunkIndexBySample(0L))
++        assertEquals(0, sourceIndex.findChunkIndexBySample(999L))
++        assertEquals(1, sourceIndex.findChunkIndexBySample(1000L))
++        assertEquals(2, sourceIndex.findChunkIndexBySample(2500L))
++        assertEquals(3, sourceIndex.findChunkIndexBySample(10_000L))
++    }
++
++    @Test
++    fun testSourceIndex_paragraphLookupAcrossMultipleParagraphs() {
++        val chunks = (0 until 4).map { idx ->
++            com.example.supertonic.language.TextChunk(idx, "Фраза $idx.", idx * 10, (idx + 1) * 10, "ru")
++        }
++        val paragraphs = listOf(
++            com.example.supertonic.data.ParagraphItem(0, "Фраза 0. Фраза 1.", 0, 19),
++            com.example.supertonic.data.ParagraphItem(1, "Фраза 2. Фраза 3.", 20, 39)
++        )
++        val sourceIndex = com.example.supertonic.core.SourceIndex(chunks, paragraphs, sampleRate = 1000)
++
++        assertEquals(0, sourceIndex.findChunkIndexByParagraph(0))
++        assertEquals(2, sourceIndex.findChunkIndexByParagraph(1))
++    }
++
++    @Test
++    fun testPcmStore_copyIntoReusesBufferAndCapacityIsClamped() {
++        val store = com.example.supertonic.audio.PcmStore(maxCapacityBytes = 1)
++        try {
++            // Capacity below the supported minimum must be clamped, not honoured.
++            assertEquals(com.example.supertonic.audio.PcmStore.MIN_CAPACITY_BYTES, store.maxCapacityBytes)
++
++            val pcm = ByteArray(4096) { (it % 64).toByte() }
++            store.put(7, pcm, durationSec = 0.1f)
++            assertEquals(4096, store.sizeOf(7))
++
++            val dst = ByteArray(4096)
++            assertEquals(4096, store.copyInto(7, dst))
++            assertArrayEquals(pcm, dst)
++
++            // Too small / missing chunk must not throw.
++            assertEquals(-1, store.copyInto(7, ByteArray(16)))
++            assertEquals(-1, store.copyInto(8, dst))
++        } finally {
++            store.clear()
++        }
++    }
++
+ }
